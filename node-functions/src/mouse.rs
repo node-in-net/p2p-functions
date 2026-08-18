@@ -12,6 +12,9 @@ mod linux_input {
 
     const RTLD_LAZY: i32 = 1;
 
+    // Field names mirror the X11/XTest entry points they hold, so a reader can
+    // match them against the C API.
+    #[allow(non_snake_case)]
     pub struct X11Api {
         lib_x11: *mut c_void,
         lib_xtst: *mut c_void,
@@ -46,11 +49,11 @@ mod linux_input {
     impl X11Api {
         pub fn load() -> Option<Self> {
             unsafe {
-                let lib_x11 = dlopen(b"libX11.so.6\0".as_ptr() as *const i8, RTLD_LAZY);
+                let lib_x11 = dlopen(c"libX11.so.6".as_ptr().cast(), RTLD_LAZY);
                 if lib_x11.is_null() {
                     return None;
                 }
-                let lib_xtst = dlopen(b"libXtst.so.6\0".as_ptr() as *const i8, RTLD_LAZY);
+                let lib_xtst = dlopen(c"libXtst.so.6".as_ptr().cast(), RTLD_LAZY);
                 if lib_xtst.is_null() {
                     dlclose(lib_x11);
                     return None;
@@ -282,17 +285,6 @@ mod macos_input {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn accessibility_permissions_returns_true_on_non_macos() {
-        assert!(check_and_request_accessibility_permissions());
-    }
-}
-
 /// Dynamic mouse control event simulator for Linux, Windows, and macOS.
 pub fn simulate_mouse_input(event: &nodeinnet_p2p::p2p::DesktopInputEvent) {
     #[cfg(target_os = "linux")]
@@ -356,19 +348,19 @@ pub fn simulate_mouse_input(event: &nodeinnet_p2p::p2p::DesktopInputEvent) {
         match event {
             nodeinnet_p2p::p2p::DesktopInputEvent::MouseMove { x, y } => {
                 let _ = std::process::Command::new("xdotool")
-                    .args(&["mousemove", &x.to_string(), &y.to_string()])
+                    .args(["mousemove", &x.to_string(), &y.to_string()])
                     .status();
             }
             nodeinnet_p2p::p2p::DesktopInputEvent::MouseDown { button } => {
                 let btn_str = button.to_string();
                 let _ = std::process::Command::new("xdotool")
-                    .args(&["mousedown", &btn_str])
+                    .args(["mousedown", &btn_str])
                     .status();
             }
             nodeinnet_p2p::p2p::DesktopInputEvent::MouseUp { button } => {
                 let btn_str = button.to_string();
                 let _ = std::process::Command::new("xdotool")
-                    .args(&["mouseup", &btn_str])
+                    .args(["mouseup", &btn_str])
                     .status();
             }
             nodeinnet_p2p::p2p::DesktopInputEvent::MouseScroll { dy } => {
@@ -376,18 +368,18 @@ pub fn simulate_mouse_input(event: &nodeinnet_p2p::p2p::DesktopInputEvent) {
                 let clicks = dy.abs();
                 for _ in 0..clicks {
                     let _ = std::process::Command::new("xdotool")
-                        .args(&["click", click_btn])
+                        .args(["click", click_btn])
                         .status();
                 }
             }
             nodeinnet_p2p::p2p::DesktopInputEvent::KeyPress { keyval } => {
                 let _ = std::process::Command::new("xdotool")
-                    .args(&["keydown", &format!("0x{:x}", keyval)])
+                    .args(["keydown", &format!("0x{:x}", keyval)])
                     .status();
             }
             nodeinnet_p2p::p2p::DesktopInputEvent::KeyRelease { keyval } => {
                 let _ = std::process::Command::new("xdotool")
-                    .args(&["keyup", &format!("0x{:x}", keyval)])
+                    .args(["keyup", &format!("0x{:x}", keyval)])
                     .status();
             }
         }
@@ -793,5 +785,16 @@ pub fn check_and_request_accessibility_permissions() -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn accessibility_permissions_returns_true_on_non_macos() {
+        assert!(check_and_request_accessibility_permissions());
     }
 }

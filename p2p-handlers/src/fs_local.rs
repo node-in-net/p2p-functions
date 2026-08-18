@@ -155,10 +155,8 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                 .map(|f| (f.0.clone(), f.1))
                 .collect();
 
-            let mut directories_permissions = None;
-            let mut files_permissions = None;
             #[cfg(unix)]
-            {
+            let (directories_permissions, files_permissions) = {
                 use std::os::unix::fs::MetadataExt;
                 let mut dir_perms = Vec::new();
                 for d in &directories_with_dates {
@@ -169,7 +167,6 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                     }
                     dir_perms.push(perm);
                 }
-                directories_permissions = Some(dir_perms);
 
                 let mut file_perms = Vec::new();
                 for f in &files_with_dates {
@@ -180,8 +177,14 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                     }
                     file_perms.push(perm);
                 }
-                files_permissions = Some(file_perms);
-            }
+                (Some(dir_perms), Some(file_perms))
+            };
+            // No mode bits off unix, so the peer gets no permission vectors at all.
+            #[cfg(not(unix))]
+            let (directories_permissions, files_permissions): (
+                Option<Vec<Option<u32>>>,
+                Option<Vec<Option<u32>>>,
+            ) = (None, None);
 
             ctx.send_msg(P2pMessage::EntriesResponse {
                 request_id,
@@ -693,7 +696,7 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
         }
         P2pMessage::FileTransferComplete {
             transfer_id,
-            checksum,
+            checksum: _,
         } => {
             let (file_name, _permissions) = {
                 let mut map = ctx.active_downloads.lock().await;

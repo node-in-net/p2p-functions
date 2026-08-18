@@ -55,7 +55,6 @@ pub fn start_desktop_stream<F, S>(
     #[cfg(feature = "synthetic-capture")]
     {
         synthetic_desktop::start_synthetic_capture(stop_flag_clone, frame_cb, status_cb);
-        return;
     }
 
     #[cfg(all(
@@ -72,7 +71,6 @@ pub fn start_desktop_stream<F, S>(
             frame_cb_inner,
             status_cb_inner,
         );
-        return;
     }
 
     #[cfg(all(
@@ -84,7 +82,6 @@ pub fn start_desktop_stream<F, S>(
         let frame_cb_inner = frame_cb.clone();
         let status_cb_inner = status_cb.clone();
         windows_desktop::start_windows_capture(stop_flag_clone, frame_cb_inner, status_cb_inner);
-        return;
     }
 
     #[cfg(all(
@@ -96,7 +93,6 @@ pub fn start_desktop_stream<F, S>(
         let frame_cb_inner = frame_cb.clone();
         let status_cb_inner = status_cb.clone();
         macos_desktop::start_macos_capture(stop_flag_clone, frame_cb_inner, status_cb_inner);
-        return;
     }
 
     #[cfg(all(

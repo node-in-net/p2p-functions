@@ -325,8 +325,8 @@ pub struct DigestAuth {
 pub fn parse_digest_auth(req: &actix_web::HttpRequest) -> Result<DigestAuth, Error> {
     if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth_header.to_str() {
-            if auth_str.starts_with("Digest ") {
-                let params = parse_digest_header(&auth_str[7..]);
+            if let Some(digest_params) = auth_str.strip_prefix("Digest ") {
+                let params = parse_digest_header(digest_params);
                 if let (Some(username), Some(realm), Some(nonce), Some(uri), Some(response)) = (
                     params.get("username"),
                     params.get("realm"),

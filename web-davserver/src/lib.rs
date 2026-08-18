@@ -26,19 +26,17 @@ pub struct CachedData<T> {
     pub expires_at: Instant,
 }
 
-pub fn get_dir_cache(
-) -> &'static Mutex<HashMap<(String, String), CachedData<Vec<nodeinnet_p2p::EntryInfo>>>> {
-    static DIR_CACHE: OnceLock<
-        Mutex<HashMap<(String, String), CachedData<Vec<nodeinnet_p2p::EntryInfo>>>>,
-    > = OnceLock::new();
+// Both caches are keyed by (resource id, path within that resource).
+pub type DirCache = Mutex<HashMap<(String, String), CachedData<Vec<nodeinnet_p2p::EntryInfo>>>>;
+pub type MetaCache = Mutex<HashMap<(String, String), CachedData<nodeinnet_p2p::EntryInfo>>>;
+
+pub fn get_dir_cache() -> &'static DirCache {
+    static DIR_CACHE: OnceLock<DirCache> = OnceLock::new();
     DIR_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn get_meta_cache(
-) -> &'static Mutex<HashMap<(String, String), CachedData<nodeinnet_p2p::EntryInfo>>> {
-    static META_CACHE: OnceLock<
-        Mutex<HashMap<(String, String), CachedData<nodeinnet_p2p::EntryInfo>>>,
-    > = OnceLock::new();
+pub fn get_meta_cache() -> &'static MetaCache {
+    static META_CACHE: OnceLock<MetaCache> = OnceLock::new();
     META_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -458,7 +456,7 @@ pub fn unmount_resource(resource_id: &str) {
     if let Some(m) = mounts().lock().unwrap().remove(resource_id) {
         let handle = m.handle;
         std::thread::spawn(move || {
-            let _ = actix_web::rt::System::new().block_on(handle.stop(true));
+            actix_web::rt::System::new().block_on(handle.stop(true));
         });
         os_mount(m.port, false, None, None);
     }
@@ -472,7 +470,7 @@ pub fn unmount_all() {
     for m in drained {
         let handle = m.handle;
         std::thread::spawn(move || {
-            let _ = actix_web::rt::System::new().block_on(handle.stop(true));
+            actix_web::rt::System::new().block_on(handle.stop(true));
         });
         os_mount(m.port, false, None, None);
     }

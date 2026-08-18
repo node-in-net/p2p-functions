@@ -1,19 +1,6 @@
 use nodeinnet_p2p::p2p::SysInfo;
 use sysinfo::{CpuExt, System, SystemExt};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn system_info_has_sensible_values() {
-        let info = get_system_info();
-        assert!(!info.os_family.is_empty(), "os_family is empty");
-        assert!(info.cpu_cores > 0, "cpu_cores should be > 0");
-        assert!(info.total_memory > 0, "total_memory should be > 0");
-    }
-}
-
 fn get_network_interfaces() -> Vec<String> {
     use network_interface::{NetworkInterface, NetworkInterfaceConfig};
     let mut network_interfaces = Vec::new();
@@ -51,5 +38,18 @@ pub fn get_system_info() -> SysInfo {
         used_swap: sys.used_swap(),
         uptime: sys.uptime(),
         network_interfaces: get_network_interfaces(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_info_has_sensible_values() {
+        let info = get_system_info();
+        assert!(!info.os_family.is_empty(), "os_family is empty");
+        assert!(info.cpu_cores > 0, "cpu_cores should be > 0");
+        assert!(info.total_memory > 0, "total_memory should be > 0");
     }
 }

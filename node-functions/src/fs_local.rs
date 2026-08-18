@@ -29,9 +29,14 @@ pub fn resolve_and_sandbox_path(base_path: &Path, user_path: &str) -> Option<Pat
     Some(base_path.join(rel_path))
 }
 
-pub fn list_local_directory(
-    target_dir: &Path,
-) -> (Vec<(String, String)>, Vec<(String, u64, String)>) {
+/// Directory: name, modification date as `%Y-%m-%d %H:%M:%S`.
+pub type DirWithDate = (String, String);
+/// File: name, size in bytes, modification date as `%Y-%m-%d %H:%M:%S`.
+pub type FileWithDate = (String, u64, String);
+/// Directories and files of one directory, in that order.
+pub type DirectoryListing = (Vec<DirWithDate>, Vec<FileWithDate>);
+
+pub fn list_local_directory(target_dir: &Path) -> DirectoryListing {
     let mut directories = Vec::new();
     let mut files = Vec::new();
 
@@ -200,9 +205,12 @@ pub async fn start_local_upload(
     mut rx: tokio_mpsc::Receiver<(u64, Vec<u8>)>,
 ) -> Result<(), String> {
     let safe_target = sanitize_windows_path(&target_file);
+    // Truncate: the channel carries the whole file, so anything past the last
+    // chunk is a leftover of the previous, longer content.
     let file_res = tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(true)
         .open(&safe_target)
         .await;
 
@@ -239,6 +247,9 @@ pub async fn write_local_file_chunk(
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        // One positioned chunk of a transfer; the file is emptied once by
+        // create_local_file, truncating here would drop the earlier chunks.
+        .truncate(false)
         .open(&safe_target)
         .await
         .map_err(|e| e.to_string())?;

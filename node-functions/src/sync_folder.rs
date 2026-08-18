@@ -183,7 +183,7 @@ pub fn scan_local_resource_folders(
                                                             Err(_) => break,
                                                         }
                                                     }
-                                                    format!("{:x}", context.compute())
+                                                    format!("{:x}", context.finalize())
                                                 } else {
                                                     String::new()
                                                 };

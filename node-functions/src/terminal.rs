@@ -111,9 +111,9 @@ pub fn spawn_pty_command(args: Vec<String>, cwd: Option<String>) -> Result<PtySe
                             // Every input_tx clone was dropped: the session is over
                             // Drop every PTY descriptor BEFORE waiting for the process to exit,
                             // so conhost.exe does not hang on open PTY references.
-                            slave_holder = None;
-                            master_holder = None;
-                            writer_holder = None;
+                            drop(slave_holder.take());
+                            drop(master_holder.take());
+                            drop(writer_holder.take());
 
                             let _ = tokio::task::spawn_blocking(move || {
                                 let _ = child.kill();
@@ -141,9 +141,9 @@ pub fn spawn_pty_command(args: Vec<String>, cwd: Option<String>) -> Result<PtySe
                     if let Ok((exited, returned_child)) = result {
                         child = returned_child;
                         if exited {
-                            slave_holder = None;
-                            master_holder = None;
-                            writer_holder = None;
+                            drop(slave_holder.take());
+                            drop(master_holder.take());
+                            drop(writer_holder.take());
 
                             let mut c = child;
                             let _ = tokio::task::spawn_blocking(move || {
