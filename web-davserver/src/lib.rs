@@ -10,15 +10,40 @@ use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
-// Global registry to link WebDAV requests with asynchronous P2P responses
+/// Links a request to the reply (or replies) the peer sends back for it.
+///
+/// An UNBOUNDED CHANNEL, not a one-shot slot, because one exchange is not always one
+/// message: a download answers `FileTransferResponse{Accepted}` first and
+/// `FileTransferComplete` last, with the payload streamed in between. A one-shot slot is
+/// consumed by whichever arrives first, so the second reply finds no waiter and the caller
+/// sees the wrong one — which is exactly how p2p downloads broke.
+///
+/// Routers must therefore `get` and send, never `remove`: the waiter owns the entry and
+/// clears it when its call returns.
 pub fn get_pending_requests(
-) -> &'static Mutex<HashMap<Uuid, oneshot::Sender<nodeinnet_p2p::P2pMessage>>> {
-    static PENDING: OnceLock<Mutex<HashMap<Uuid, oneshot::Sender<nodeinnet_p2p::P2pMessage>>>> =
-        OnceLock::new();
+) -> &'static Mutex<HashMap<Uuid, mpsc::UnboundedSender<nodeinnet_p2p::P2pMessage>>> {
+    static PENDING: OnceLock<
+        Mutex<HashMap<Uuid, mpsc::UnboundedSender<nodeinnet_p2p::P2pMessage>>>,
+    > = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Clears a pending registration when the call that made it returns, however it returns.
+///
+/// Routers no longer remove entries — a transfer is answered more than once, so removing on
+/// the first reply loses the rest. That makes cleanup the waiter's job, and a guard is the
+/// only way to get it right on the error and timeout paths too.
+pub struct PendingGuard(pub Uuid);
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = get_pending_requests().lock() {
+            pending.remove(&self.0);
+        }
+    }
 }
 
 pub struct CachedData<T> {
@@ -188,7 +213,9 @@ pub fn feed_response(msg: nodeinnet_p2p::P2pMessage) -> Option<nodeinnet_p2p::P2
         | M::SetPermissionsResponse { request_id, .. } => *request_id,
         _ => return Some(msg),
     };
-    match get_pending_requests().lock().unwrap().remove(&id) {
+    // `get`, not `remove`: the waiter's guard owns the entry's lifetime now.
+    let tx = get_pending_requests().lock().unwrap().get(&id).cloned();
+    match tx {
         Some(tx) => {
             let _ = tx.send(msg);
             None

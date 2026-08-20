@@ -80,12 +80,13 @@ impl DavFileSystem for NodeInNetDavFs {
 
                 if options.read {
                     let transfer_id = uuid::Uuid::new_v4();
-                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
                     {
                         let mut pending = crate::get_pending_requests().lock().unwrap();
                         pending.insert(transfer_id, tx);
                     }
+                    let _pending_guard = crate::PendingGuard(transfer_id);
 
                     let msg = nodeinnet_p2p::P2pMessage::FileDownloadRequest {
                         resource_id,
@@ -95,24 +96,35 @@ impl DavFileSystem for NodeInNetDavFs {
 
                     let _ = this.p2p_tx.send(msg).await;
 
-                    // Wait until the file is fully downloaded into the temp dir
-                    match rx.await {
-                        Ok(nodeinnet_p2p::P2pMessage::FileTransferComplete { .. }) => {
-                            let temp_path = std::env::temp_dir().join(transfer_id.to_string());
-                            if let Ok(data) = tokio::fs::read(&temp_path).await {
-                                let _ = tokio::fs::remove_file(&temp_path).await;
-                                let file = NodeInNetDavFile::new_read(data);
-                                return Ok(Box::new(file) as Box<dyn DavFile>);
+                    // Wait until the file is fully downloaded into the temp dir.
+                    //
+                    // TWO replies arrive: `FileTransferResponse{Accepted}` when the peer has
+                    // opened the file, and `FileTransferComplete` when the last chunk has
+                    // landed. Only the second means the temp file is whole, so the first is
+                    // skipped rather than mistaken for an answer.
+                    loop {
+                        match rx.recv().await {
+                            Some(nodeinnet_p2p::P2pMessage::FileTransferResponse {
+                                status: nodeinnet_p2p::FileTransferStatus::Accepted { .. },
+                                ..
+                            }) => continue,
+                            Some(nodeinnet_p2p::P2pMessage::FileTransferComplete { .. }) => {
+                                let temp_path = std::env::temp_dir().join(transfer_id.to_string());
+                                if let Ok(data) = tokio::fs::read(&temp_path).await {
+                                    let _ = tokio::fs::remove_file(&temp_path).await;
+                                    let file = NodeInNetDavFile::new_read(data);
+                                    return Ok(Box::new(file) as Box<dyn DavFile>);
+                                }
+                                return Err(FsError::NotFound);
                             }
-                            return Err(FsError::NotFound);
+                            Some(nodeinnet_p2p::P2pMessage::FileTransferResponse {
+                                status: nodeinnet_p2p::FileTransferStatus::Rejected { .. },
+                                ..
+                            }) => {
+                                return Err(FsError::Forbidden);
+                            }
+                            _ => return Err(FsError::NotFound),
                         }
-                        Ok(nodeinnet_p2p::P2pMessage::FileTransferResponse {
-                            status: nodeinnet_p2p::FileTransferStatus::Rejected { .. },
-                            ..
-                        }) => {
-                            return Err(FsError::Forbidden);
-                        }
-                        _ => return Err(FsError::NotFound),
                     }
                 }
 
@@ -175,12 +187,13 @@ impl DavFileSystem for NodeInNetDavFs {
                 }
 
                 let request_id = uuid::Uuid::new_v4();
-                let (tx, rx) = tokio::sync::oneshot::channel();
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
                 {
                     let mut pending = crate::get_pending_requests().lock().unwrap();
                     pending.insert(request_id, tx);
                 }
+                let _pending_guard = crate::PendingGuard(request_id);
 
                 let msg = nodeinnet_p2p::P2pMessage::RequestEntries {
                     request_id,
@@ -190,8 +203,8 @@ impl DavFileSystem for NodeInNetDavFs {
 
                 let _ = this.p2p_tx.send(msg).await;
 
-                match rx.await {
-                    Ok(nodeinnet_p2p::P2pMessage::EntriesResponse {
+                match rx.recv().await {
+                    Some(nodeinnet_p2p::P2pMessage::EntriesResponse {
                         directories,
                         mut files,
                         ..
@@ -314,12 +327,13 @@ impl DavFileSystem for NodeInNetDavFs {
                 }
 
                 let request_id = uuid::Uuid::new_v4();
-                let (tx, rx) = tokio::sync::oneshot::channel();
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
                 {
                     let mut pending = crate::get_pending_requests().lock().unwrap();
                     pending.insert(request_id, tx);
                 }
+                let _pending_guard = crate::PendingGuard(request_id);
 
                 let msg = nodeinnet_p2p::P2pMessage::RequestMetadata {
                     request_id,
@@ -329,8 +343,8 @@ impl DavFileSystem for NodeInNetDavFs {
 
                 let _ = this.p2p_tx.send(msg).await;
 
-                match rx.await {
-                    Ok(nodeinnet_p2p::P2pMessage::MetadataResponse {
+                match rx.recv().await {
+                    Some(nodeinnet_p2p::P2pMessage::MetadataResponse {
                         metadata: Some(meta),
                         ..
                     }) => {
@@ -383,11 +397,12 @@ impl DavFileSystem for NodeInNetDavFs {
                 };
 
                 let request_id = uuid::Uuid::new_v4();
-                let (tx, rx) = tokio::sync::oneshot::channel();
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                 {
                     let mut pending = crate::get_pending_requests().lock().unwrap();
                     pending.insert(request_id, tx);
                 }
+                let _pending_guard = crate::PendingGuard(request_id);
 
                 let msg = nodeinnet_p2p::P2pMessage::CreateDirectoryRequest {
                     request_id,
@@ -398,8 +413,8 @@ impl DavFileSystem for NodeInNetDavFs {
                 };
                 let _ = this.p2p_tx.send(msg).await;
 
-                match rx.await {
-                    Ok(nodeinnet_p2p::P2pMessage::CreateDirectoryResponse {
+                match rx.recv().await {
+                    Some(nodeinnet_p2p::P2pMessage::CreateDirectoryResponse {
                         result: Ok(_),
                         ..
                     }) => Ok(()),
@@ -428,11 +443,12 @@ impl DavFileSystem for NodeInNetDavFs {
                 let resource_id = drive.lock().unwrap().id.clone();
 
                 let request_id = uuid::Uuid::new_v4();
-                let (tx, rx) = tokio::sync::oneshot::channel();
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                 {
                     let mut pending = crate::get_pending_requests().lock().unwrap();
                     pending.insert(request_id, tx);
                 }
+                let _pending_guard = crate::PendingGuard(request_id);
 
                 let msg = nodeinnet_p2p::P2pMessage::DeleteEntryRequest {
                     request_id,
@@ -441,8 +457,8 @@ impl DavFileSystem for NodeInNetDavFs {
                 };
                 let _ = this.p2p_tx.send(msg).await;
 
-                match rx.await {
-                    Ok(nodeinnet_p2p::P2pMessage::DeleteEntryResponse {
+                match rx.recv().await {
+                    Some(nodeinnet_p2p::P2pMessage::DeleteEntryResponse {
                         result: Ok(_), ..
                     }) => Ok(()),
                     _ => Err(FsError::Forbidden),
@@ -475,11 +491,12 @@ impl DavFileSystem for NodeInNetDavFs {
                 let resource_id = drive_from.lock().unwrap().id.clone();
 
                 let request_id = uuid::Uuid::new_v4();
-                let (tx, rx) = tokio::sync::oneshot::channel();
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                 {
                     let mut pending = crate::get_pending_requests().lock().unwrap();
                     pending.insert(request_id, tx);
                 }
+                let _pending_guard = crate::PendingGuard(request_id);
 
                 let msg = nodeinnet_p2p::P2pMessage::RenameEntryRequest {
                     request_id,
@@ -489,8 +506,8 @@ impl DavFileSystem for NodeInNetDavFs {
                 };
                 let _ = this.p2p_tx.send(msg).await;
 
-                match rx.await {
-                    Ok(nodeinnet_p2p::P2pMessage::RenameEntryResponse {
+                match rx.recv().await {
+                    Some(nodeinnet_p2p::P2pMessage::RenameEntryResponse {
                         result: Ok(_), ..
                     }) => Ok(()),
                     _ => Err(FsError::Forbidden),
