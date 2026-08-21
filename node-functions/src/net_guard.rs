@@ -1,12 +1,7 @@
-//! Where a peer's relayed traffic is allowed to go. Sharing an internet
-//! connection is not the same as opening the LAN, but to a proxy both are just
-//! a host and a port.
 
 use std::net::{IpAddr, SocketAddr};
 
-/// True when `addr` is ours or shares a subnet with one of our interfaces.
-/// Ranges cannot answer this: on IPv6 a router and a web server both sit in
-/// 2000::/3, and our own routable address looks public too.
+/// True when `addr` is ours or shares a subnet with one of our interfaces. Ranges.
 fn is_on_our_network(addr: &IpAddr) -> bool {
     use network_interface::{NetworkInterface, NetworkInterfaceConfig};
     let Ok(ifaces) = NetworkInterface::show() else {
@@ -34,7 +29,6 @@ fn is_on_our_network(addr: &IpAddr) -> bool {
         })
 }
 
-/// True when `addr` is reachable only from this machine or its local network.
 pub fn is_local_target(addr: &IpAddr) -> bool {
     if is_on_our_network(addr) {
         return true;
@@ -42,7 +36,6 @@ pub fn is_local_target(addr: &IpAddr) -> bool {
     is_in_local_range(addr)
 }
 
-/// The address ranges that are local no matter what the interfaces say.
 fn is_in_local_range(addr: &IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => {
@@ -70,10 +63,6 @@ fn is_in_local_range(addr: &IpAddr) -> bool {
     }
 }
 
-/// Resolves `host:port` and keeps the addresses a peer may be connected to.
-///
-/// Filters the resolved address, not the name — any name can point at
-/// `192.168.1.1`. Connect to what this returns; a second lookup can differ.
 pub async fn resolve_allowed(
     host: &str,
     port: u16,
@@ -160,8 +149,7 @@ mod tests {
         assert!(err.is_err(), "localhost must not be reachable by default");
     }
 
-    /// Range checks cannot see this: the machine's own addresses are ordinary
-    /// public ones, and a service bound to 0.0.0.0 answers on them.
+    /// Range checks cannot see this: the machine's own addresses are ordinary public ones,.
     #[test]
     fn blocks_this_machines_own_addresses() {
         use network_interface::{NetworkInterface, NetworkInterfaceConfig};

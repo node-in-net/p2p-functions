@@ -1,5 +1,3 @@
-//! The platform capture and input backends, behind the transport's
-//! [`DesktopProvider`] trait.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -9,8 +7,6 @@ use client_core::desktop::{
 };
 use nodeinnet_p2p::DesktopInputEvent;
 
-/// Serves this machine's screen: PipeWire on Linux, Windows Graphics Capture,
-/// ScreenCaptureKit on macOS.
 #[derive(Default)]
 pub struct SystemDesktop;
 

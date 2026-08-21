@@ -8,16 +8,13 @@ pub fn sanitize_windows_path(path: &Path) -> PathBuf {
     {
         let p_str = path.to_string_lossy();
         if p_str.starts_with('/') && p_str.len() >= 3 && p_str.chars().nth(2) == Some(':') {
-            // like /C:\... -> C:\...
             return PathBuf::from(&p_str[1..]);
         }
     }
     path.to_path_buf()
 }
 
-/// Resolves a peer-supplied path inside `base_path`, or `None` if it tries to
-/// leave. Only plain names pass: `join` replaces the base outright when given a
-/// root or a drive prefix, so `C:\Windows` would otherwise escape the share.
+/// Resolves a peer-supplied path inside `base_path`, or `None` if it tries to leave..
 pub fn resolve_and_sandbox_path(base_path: &Path, user_path: &str) -> Option<PathBuf> {
     let rel_path = user_path.trim_start_matches('/');
     for component in Path::new(rel_path).components() {
@@ -29,11 +26,8 @@ pub fn resolve_and_sandbox_path(base_path: &Path, user_path: &str) -> Option<Pat
     Some(base_path.join(rel_path))
 }
 
-/// Directory: name, modification date as `%Y-%m-%d %H:%M:%S`.
 pub type DirWithDate = (String, String);
-/// File: name, size in bytes, modification date as `%Y-%m-%d %H:%M:%S`.
 pub type FileWithDate = (String, u64, String);
-/// Directories and files of one directory, in that order.
 pub type DirectoryListing = (Vec<DirWithDate>, Vec<FileWithDate>);
 
 pub fn list_local_directory(target_dir: &Path) -> DirectoryListing {
@@ -205,8 +199,6 @@ pub async fn start_local_upload(
     mut rx: tokio_mpsc::Receiver<(u64, Vec<u8>)>,
 ) -> Result<(), String> {
     let safe_target = sanitize_windows_path(&target_file);
-    // Truncate: the channel carries the whole file, so anything past the last
-    // chunk is a leftover of the previous, longer content.
     let file_res = tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -247,8 +239,6 @@ pub async fn write_local_file_chunk(
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        // One positioned chunk of a transfer; the file is emptied once by
-        // create_local_file, truncating here would drop the earlier chunks.
         .truncate(false)
         .open(&safe_target)
         .await
@@ -268,7 +258,6 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    // ── pure functions ────────────────────────────────────────────────────────
 
     #[test]
     fn sanitize_non_windows_path_is_identity() {
@@ -296,7 +285,6 @@ mod tests {
         }
     }
 
-    // ── resolve_and_sandbox_path ──────────────────────────────────────────────
 
     #[test]
     fn sandbox_normal_path_resolves() {
@@ -347,7 +335,6 @@ mod tests {
         assert!(resolve_and_sandbox_path(base, "\\Windows").is_none());
     }
 
-    // ── list_local_directory ──────────────────────────────────────────────────
 
     #[test]
     fn list_empty_dir_returns_empty() {
@@ -378,7 +365,6 @@ mod tests {
         assert!(files.is_empty());
     }
 
-    // ── get_local_metadata ────────────────────────────────────────────────────
 
     #[test]
     fn metadata_of_file() {
@@ -409,7 +395,6 @@ mod tests {
         assert!(info.is_none());
     }
 
-    // ── async FS operations ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn create_directory_succeeds() {

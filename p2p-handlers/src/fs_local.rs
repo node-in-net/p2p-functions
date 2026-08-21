@@ -4,16 +4,13 @@ use p2p_node::NodeContext;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc as tokio_mpsc;
 
-/// One named share: a human `name` (what a peer sees as a folder in the virtual
-/// root) → a `path` that stays LOCAL (never leaves this node). Peers address
-/// shares by name; we resolve the name to the local path here, on the server.
+/// One named share: a human `name` (what a peer sees as a folder in the virtual root) →.
 #[derive(serde::Deserialize, Clone)]
 pub struct Share {
     pub name: String,
     pub path: String,
 }
 
-/// A Filesystem resource's LOCAL config: its list of named shares.
 #[derive(serde::Deserialize, Clone, Default)]
 pub struct FsConfig {
     #[serde(default)]
@@ -31,15 +28,9 @@ fn shares_of(ctx: &NodeContext, resource_id: &str) -> Vec<Share> {
         .unwrap_or_default()
 }
 
-/// Where a peer's VIRTUAL path lands inside our named-share namespace.
 #[derive(Debug, PartialEq)]
 enum Resolved {
-    /// The virtual root (≥2 shares, path == "/"): callers list these share
-    /// NAMES as folders; writes/metadata here are rejected (no backing dir).
     Root(Vec<String>),
-    /// A concrete local path, plus what response paths need to stay virtual:
-    /// the share's local base and its `/<name>` prefix ("" for a lone share
-    /// whose content IS the root).
     At {
         local: PathBuf,
         share_base: PathBuf,
@@ -47,10 +38,6 @@ enum Resolved {
     },
 }
 
-/// Pure routing (unit-tested): map a peer VIRTUAL path onto the share list.
-/// 1 share ⇒ its content is the root; ≥2 ⇒ "/" lists names and "/<name>/rest"
-/// dispatches into that share (each sandboxed under its OWN base). Returns
-/// `None` (fail CLOSED) on an unknown share or a path-traversal attempt.
 fn resolve_in(shares: &[Share], vpath: &str) -> Option<Resolved> {
     if shares.is_empty() {
         return None;
@@ -85,8 +72,6 @@ fn resolve(ctx: &NodeContext, resource_id: &str, vpath: &str) -> Option<Resolved
     resolve_in(&shares_of(ctx, resource_id), vpath)
 }
 
-/// The virtual parent-directory path of a resolved local target — what goes in
-/// `*Response.parent_path` so the consumer stays in the virtual namespace.
 fn virtual_parent(local: &Path, share_base: &Path, prefix: &str) -> String {
     let parent = local.parent().unwrap_or(share_base);
     let rel = parent
@@ -112,7 +97,6 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
             let target_dir = match resolve(&ctx, &resource_id, &path) {
                 Some(Resolved::At { local, .. }) => local,
                 Some(Resolved::Root(names)) => {
-                    // Virtual root: list the shares themselves, as folders.
                     ctx.send_msg(P2pMessage::EntriesResponse {
                         request_id,
                         resource_id,
@@ -179,7 +163,6 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                 }
                 (Some(dir_perms), Some(file_perms))
             };
-            // No mode bits off unix, so the peer gets no permission vectors at all.
             #[cfg(not(unix))]
             let (directories_permissions, files_permissions): (
                 Option<Vec<Option<u32>>>,
@@ -207,7 +190,6 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
             let target_entry = match resolve(&ctx, &resource_id, &path) {
                 Some(Resolved::At { local, .. }) => local,
                 _ => {
-                    // Virtual root or unknown share/traversal: no file metadata.
                     ctx.send_msg(P2pMessage::MetadataResponse {
                         request_id,
                         resource_id,
@@ -255,7 +237,6 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                     p
                 }
                 _ => {
-                    // Virtual root (no backing dir) or unknown share / traversal.
                     ctx.send_msg(P2pMessage::CreateDirectoryResponse {
                         request_id,
                         resource_id,
@@ -470,7 +451,6 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                 .insert(transfer_id, (final_path.clone(), total_size, permissions));
             let _ = fs_local::create_local_directory(&final_dir).await;
 
-            // Just test if we can create it, then accept. The stream processing will happen in FileChunk.
             if let Err(e) = fs_local::create_local_file(&final_path).await {
                 ctx.log(format!("❌ Failed to create file for upload: {}", e));
                 ctx.send_msg(P2pMessage::FileTransferResponse {
@@ -820,7 +800,6 @@ mod tests {
 
     #[test]
     fn virtual_parent_stays_in_the_virtual_namespace() {
-        // single share: no prefix
         assert_eq!(
             virtual_parent(Path::new("/srv/home/a/b.txt"), Path::new("/srv/home"), ""),
             "/a"
@@ -829,7 +808,6 @@ mod tests {
             virtual_parent(Path::new("/srv/home/a"), Path::new("/srv/home"), ""),
             "/"
         );
-        // multi share: "/<Name>" prefix
         assert_eq!(
             virtual_parent(
                 Path::new("/srv/dl/a/b.txt"),

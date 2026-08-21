@@ -12,8 +12,6 @@ mod linux_input {
 
     const RTLD_LAZY: i32 = 1;
 
-    // Field names mirror the X11/XTest entry points they hold, so a reader can
-    // match them against the C API.
     #[allow(non_snake_case)]
     pub struct X11Api {
         lib_x11: *mut c_void,
@@ -285,11 +283,9 @@ mod macos_input {
     }
 }
 
-/// Dynamic mouse control event simulator for Linux, Windows, and macOS.
 pub fn simulate_mouse_input(event: &nodeinnet_p2p::p2p::DesktopInputEvent) {
     #[cfg(target_os = "linux")]
     {
-        // Try native X11 / XTest emulation first by dynamically loading libX11 / libXtst
         if let Some(api) = linux_input::X11Api::load() {
             unsafe {
                 let display = (api.XOpenDisplay)(std::ptr::null());
@@ -344,7 +340,6 @@ pub fn simulate_mouse_input(event: &nodeinnet_p2p::p2p::DesktopInputEvent) {
             }
         }
 
-        // Wayland / Headless safe CLI fallback (xdotool)
         match event {
             nodeinnet_p2p::p2p::DesktopInputEvent::MouseMove { x, y } => {
                 let _ = std::process::Command::new("xdotool")
@@ -388,12 +383,10 @@ pub fn simulate_mouse_input(event: &nodeinnet_p2p::p2p::DesktopInputEvent) {
     #[cfg(target_os = "windows")]
     fn gdk_keyval_to_windows_vk(keyval: u32) -> Option<u16> {
         match keyval {
-            // Alphanumeric keys (ASCII mapping for basic letters/numbers)
             0x030..=0x039 => Some((keyval - 0x030 + 0x30) as u16), // '0'..'9'
             0x041..=0x05a => Some(keyval as u16),                  // 'A'..'Z'
             0x061..=0x07a => Some((keyval - 0x061 + 0x41) as u16), // 'a'..'z' -> VK_A..VK_Z
 
-            // Control Keys
             0xff08 => Some(0x08),          // BackSpace (VK_BACK)
             0xff09 => Some(0x09),          // Tab (VK_TAB)
             0xff0d | 0xff8d => Some(0x0d), // Return / KP_Enter (VK_RETURN)
@@ -410,7 +403,6 @@ pub fn simulate_mouse_input(event: &nodeinnet_p2p::p2p::DesktopInputEvent) {
             0xff63 => Some(0x2d),          // Insert (VK_INSERT)
             0xffff => Some(0x2e),          // Delete (VK_DELETE)
 
-            // Modifiers
             0xffe1 | 0xffe2 => Some(0x10), // Shift L/R (VK_SHIFT)
             0xffe3 | 0xffe4 => Some(0x11), // Control L/R (VK_CONTROL)
             0xffe5 => Some(0x14),          // Caps Lock (VK_CAPITAL)
@@ -423,7 +415,6 @@ pub fn simulate_mouse_input(event: &nodeinnet_p2p::p2p::DesktopInputEvent) {
     #[cfg(target_os = "macos")]
     fn gdk_keyval_to_macos_code(keyval: u32) -> Option<u16> {
         match keyval {
-            // Letters
             0x061 | 0x041 => Some(0),  // A
             0x073 | 0x053 => Some(1),  // S
             0x064 | 0x044 => Some(2),  // D
@@ -450,7 +441,6 @@ pub fn simulate_mouse_input(event: &nodeinnet_p2p::p2p::DesktopInputEvent) {
             0x06e | 0x04e => Some(45), // N
             0x06d | 0x04d => Some(46), // M
 
-            // Numbers
             0x031 => Some(18), // 1
             0x032 => Some(19), // 2
             0x033 => Some(20), // 3
@@ -462,7 +452,6 @@ pub fn simulate_mouse_input(event: &nodeinnet_p2p::p2p::DesktopInputEvent) {
             0x039 => Some(25), // 9
             0x030 => Some(29), // 0
 
-            // Navigation / Control
             0xff0d | 0xff8d => Some(36), // Enter
             0xff09 => Some(48),          // Tab
             0x020 => Some(49),           // Space
@@ -473,7 +462,6 @@ pub fn simulate_mouse_input(event: &nodeinnet_p2p::p2p::DesktopInputEvent) {
             0xff54 => Some(125),         // Down Arrow
             0xff52 => Some(126),         // Up Arrow
 
-            // Modifiers
             0xffe1 | 0xffe2 => Some(56), // Shift
             0xffe3 | 0xffe4 => Some(59), // Control
             0xffe9 | 0xffea => Some(58), // Alt/Option
@@ -749,8 +737,6 @@ pub fn simulate_mouse_input(event: &nodeinnet_p2p::p2p::DesktopInputEvent) {
     }
 }
 
-/// Checks if the application has macOS Accessibility permissions, and requests them if missing.
-/// On other platforms, this is a no-op that returns true.
 pub fn check_and_request_accessibility_permissions() -> bool {
     #[cfg(target_os = "macos")]
     {

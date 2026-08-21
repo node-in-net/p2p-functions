@@ -2,15 +2,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc as tokio_mpsc;
 
-/// Opens a plain TCP connection to `host:port` on a peer's behalf — the exit
-/// side of the peer's SOCKS proxy. No SOCKS5 handshake happens here; the peer's
-/// own client speaks it and sends us an already-resolved target.
-///
-/// Returns a channel carrying bytes read from the target, while bytes from
-/// `local_rx` are written to the socket.
-///
-/// `allow_local` opens up the host's own network; without it the peer reaches
-/// the internet and nothing else. See [`crate::net_guard`].
 pub async fn start_socks_client(
     host: &str,
     port: u16,
@@ -25,7 +16,6 @@ pub async fn start_socks_client(
 
             let read_task_tx = tx_to_caller.clone();
 
-            // Task 1: Read from TCP and send to caller
             let read_task = tokio::spawn(async move {
                 let mut buf = [0u8; 16384];
                 loop {
@@ -41,7 +31,6 @@ pub async fn start_socks_client(
                 }
             });
 
-            // Task 2: Read from caller and write to TCP
             let write_task = tokio::spawn(async move {
                 while let Some(data) = local_rx.recv().await {
                     if tx_tcp.write_all(&data).await.is_err() {
@@ -50,7 +39,6 @@ pub async fn start_socks_client(
                 }
             });
 
-            // Keep the task handles alive globally but they will terminate when channels or sockets drop
             tokio::spawn(async move {
                 tokio::select! {
                     _ = read_task => (),

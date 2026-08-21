@@ -101,7 +101,6 @@ pub fn start_linux_capture<F, S>(
             return;
         }
 
-        // Start the portal screencast (WindowIdentifier::default() works headless)
         let window_id = WindowIdentifier::default();
         let response = match screencast_portal.start(&session, &window_id).await {
             Ok(request) => match request.response() {
@@ -267,7 +266,6 @@ pub fn start_linux_capture<F, S>(
         }
 
         let _ = pipeline.set_state(gstreamer::State::Null);
-        // pipewiresrc only borrowed the raw fd, so it stays open until here
         drop(fd);
 
         let _ = session.close().await;
@@ -276,7 +274,6 @@ pub fn start_linux_capture<F, S>(
     });
 }
 
-/// Fallback capture loop using periodic `screenshots` snapshots of the primary screen.
 pub fn start_screenshots_fallback_loop<F, S>(
     stop_flag: Arc<AtomicBool>,
     frame_callback: Arc<F>,
@@ -324,7 +321,6 @@ pub fn start_screenshots_fallback_loop<F, S>(
                 let height = image.height() as usize;
                 let raw_rgba = image.as_raw();
 
-                // The screenshots crate hands back RGBA; CapturedFrame is BGRA.
                 let mut bgra_data = vec![0u8; width * height * 4];
                 for i in (0..raw_rgba.len()).step_by(4) {
                     if i + 3 < raw_rgba.len() {

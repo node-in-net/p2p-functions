@@ -214,7 +214,6 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    // ── compute_sync_diff ─────────────────────────────────────────────────────
 
     #[test]
     fn empty_inputs_produce_no_diffs() {
@@ -349,7 +348,6 @@ mod tests {
         assert_eq!(docs.difference, FileDifference::Modified);
     }
 
-    // ── scan_local_resource_folders ───────────────────────────────────────────
 
     #[test]
     fn non_sync_folder_resource_is_skipped() {
@@ -393,7 +391,6 @@ mod tests {
 
         let file = &result["f"][0];
         assert!(!file.md5_hash.is_empty());
-        // MD5 of "content" is 9a0364b9e99bb480dd25e1f0284c8555
         assert_eq!(file.md5_hash, "9a0364b9e99bb480dd25e1f0284c8555");
     }
 
@@ -430,7 +427,6 @@ mod tests {
     fn nonexistent_path_returns_empty_entry() {
         let res = make_resource("f", "/this/path/does/not/exist/xyz", &[]);
         let result = scan_local_resource_folders(&[res]);
-        // Entry for the resource name is inserted but with no files
         let files = result.get("f").unwrap();
         assert!(files.is_empty());
     }

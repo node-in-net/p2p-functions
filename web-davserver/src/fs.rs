@@ -75,7 +75,7 @@ impl DavFileSystem for NodeInNetDavFs {
                     return Err(FsError::NotFound);
                 }
 
-                // Single expression: the MutexGuard is created and dropped immediately, never captured in the Future state
+                // Single expression: the MutexGuard is created and dropped immediately, never captured.
                 let resource_id = drive.lock().unwrap().id.clone();
 
                 if options.read {
@@ -96,12 +96,6 @@ impl DavFileSystem for NodeInNetDavFs {
 
                     let _ = this.p2p_tx.send(msg).await;
 
-                    // Wait until the file is fully downloaded into the temp dir.
-                    //
-                    // TWO replies arrive: `FileTransferResponse{Accepted}` when the peer has
-                    // opened the file, and `FileTransferComplete` when the last chunk has
-                    // landed. Only the second means the temp file is whole, so the first is
-                    // skipped rather than mistaken for an answer.
                     loop {
                         match rx.recv().await {
                             Some(nodeinnet_p2p::P2pMessage::FileTransferResponse {
@@ -128,7 +122,6 @@ impl DavFileSystem for NodeInNetDavFs {
                     }
                 }
 
-                // Write (create or overwrite)
                 if options.write {
                     let name = path.file_name().unwrap_or("").as_bytes().to_vec();
                     let file = NodeInNetDavFile::new_write(
@@ -209,7 +202,6 @@ impl DavFileSystem for NodeInNetDavFs {
                         mut files,
                         ..
                     }) => {
-                        // Spotlight opt-out marker: keeps macOS from indexing the mount
                         if sub_path == "/" {
                             files.push((".metadata_never_index".to_string(), 0));
                         }
@@ -241,7 +233,6 @@ impl DavFileSystem for NodeInNetDavFs {
                                 },
                             );
 
-                            // CACHE PRE-WARM: store metadata for every contained file right away
                             let mut meta_cache = crate::get_meta_cache().lock().unwrap();
                             for e in &entries {
                                 let entry_path = if sub_path == "/" {
@@ -677,10 +668,6 @@ impl DavFile for NodeInNetDavFile {
                     transfer_id,
                     permissions: None,
                 };
-                // Wait to be told the transfer exists instead of guessing how
-                // long that takes. The old fixed 200 ms was both a race — chunks
-                // arriving before the peer registered `transfer_id` are dropped
-                // without a word — and a toll paid on every single file.
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                 {
                     let mut pending = crate::get_pending_requests().lock().unwrap();
@@ -711,10 +698,6 @@ impl DavFile for NodeInNetDavFile {
                             offset: offset as u64,
                             data: chunk_data.to_vec(),
                         };
-                        // `send` on a bounded queue waits for room, and the
-                        // transport below paces itself off the SCTP buffer. A
-                        // fixed per-chunk delay on top of that only cost time:
-                        // 2 ms per 16 KiB is about two minutes per gigabyte.
                         let _ = p2p_tx.send(chunk).await;
                         offset += chunk_data.len();
                     }
@@ -774,7 +757,6 @@ mod tests {
     use super::*;
     use dav_server::fs::DavMetaData;
 
-    // --- is_ignored_junk ---
 
     #[test]
     fn ds_store_is_junk() {
@@ -811,7 +793,6 @@ mod tests {
         assert!(NodeInNetDavFs::is_ignored_junk("/share/autorun.inf"));
     }
 
-    // --- NodeInNetMetaData ---
 
     #[test]
     fn metadata_len_returns_size() {
@@ -854,7 +835,6 @@ mod tests {
         assert!(meta.modified().is_ok());
     }
 
-    // --- NodeInNetDavFile ---
 
     #[test]
     fn new_read_sets_is_write_false() {

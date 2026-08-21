@@ -63,7 +63,6 @@ fn draw_text(
 pub fn generate_bgra_frame(width: usize, height: usize, frame_num: usize) -> Vec<u8> {
     let mut frame = vec![0u8; width * height * 4];
 
-    // BGRA (Blue, Green, Red, Alpha) - moving concentric ripples
     for y in 0..height {
         for x in 0..width {
             let dx = x as f32 - (width as f32 / 2.0);
@@ -79,7 +78,6 @@ pub fn generate_bgra_frame(width: usize, height: usize, frame_num: usize) -> Vec
         }
     }
 
-    // Draw date & time on BGRA buffer
     let now = chrono::Local::now();
     let time_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
     draw_text(&mut frame, width, height, 20, 20, &time_str);
@@ -107,8 +105,6 @@ mod tests {
 
     #[test]
     fn dash_draws_nothing_in_first_three_rows() {
-        // '-' bitmap: rows 0-2 are 0x00, only row 3 (0x7e) has pixels
-        // Each pixel row is scaled 2x, so rows 0-5 (y 0..6) should be blank
         let mut buf = vec![0u8; 100 * 100 * 4];
         draw_char(&mut buf, 100, 100, 0, 0, '-');
         for y in 0..6usize {
@@ -136,7 +132,6 @@ mod tests {
     }
 }
 
-/// Spawns a background task to generate synthetic BGRA frames at ~15 FPS.
 pub fn start_synthetic_capture<F, S>(
     stop_flag: Arc<AtomicBool>,
     frame_callback: Arc<F>,

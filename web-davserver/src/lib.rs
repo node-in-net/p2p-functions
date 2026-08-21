@@ -13,16 +13,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-/// Links a request to the reply (or replies) the peer sends back for it.
-///
-/// An UNBOUNDED CHANNEL, not a one-shot slot, because one exchange is not always one
-/// message: a download answers `FileTransferResponse{Accepted}` first and
-/// `FileTransferComplete` last, with the payload streamed in between. A one-shot slot is
-/// consumed by whichever arrives first, so the second reply finds no waiter and the caller
-/// sees the wrong one — which is exactly how p2p downloads broke.
-///
-/// Routers must therefore `get` and send, never `remove`: the waiter owns the entry and
-/// clears it when its call returns.
+/// Links a request to the reply (or replies) the peer sends back for it.  An UNBOUNDED.
 pub fn get_pending_requests(
 ) -> &'static Mutex<HashMap<Uuid, mpsc::UnboundedSender<nodeinnet_p2p::P2pMessage>>> {
     static PENDING: OnceLock<
@@ -31,11 +22,6 @@ pub fn get_pending_requests(
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Clears a pending registration when the call that made it returns, however it returns.
-///
-/// Routers no longer remove entries — a transfer is answered more than once, so removing on
-/// the first reply loses the rest. That makes cleanup the waiter's job, and a guard is the
-/// only way to get it right on the error and timeout paths too.
 pub struct PendingGuard(pub Uuid);
 
 impl Drop for PendingGuard {
@@ -51,7 +37,6 @@ pub struct CachedData<T> {
     pub expires_at: Instant,
 }
 
-// Both caches are keyed by (resource id, path within that resource).
 pub type DirCache = Mutex<HashMap<(String, String), CachedData<Vec<nodeinnet_p2p::EntryInfo>>>>;
 pub type MetaCache = Mutex<HashMap<(String, String), CachedData<nodeinnet_p2p::EntryInfo>>>;
 
@@ -131,9 +116,6 @@ async fn handle_dav_request(
     resp.streaming(stream)
 }
 
-/// The unguessable path segment a mount lives under, empty when unused. The
-/// port is trivially scannable; 128 bits of path are not. Stripped before the
-/// filesystem sees it, so the mounted drive opens straight at the contents.
 #[derive(Clone, Default)]
 pub struct MountPrefix(pub String);
 
@@ -165,9 +147,6 @@ fn path_is_under(path: &str, prefix: &str) -> bool {
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
-// ── Mount lifecycle ─────────────────────────────────────────────────────────
-// Start a WebDAV server for a peer's shared resource, ask the OS to mount it
-// as a drive, and reverse both on unmount. Shared by all front-ends.
 
 struct MountedServer {
     handle: actix_web::dev::ServerHandle,
@@ -183,25 +162,19 @@ fn free_port() -> Option<u16> {
     (8001..9000).find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
 }
 
-/// What this process mounted, keyed by port: a drive letter on Windows, a
-/// `/Volumes` path on macOS. Every mount shares `127.0.0.1`, so at unmount the
-/// name cannot be guessed without hitting another peer's.
+/// What this process mounted, keyed by port: a drive letter on Windows, a `/Volumes`.
 fn mapped_drives() -> &'static Mutex<HashMap<u16, String>> {
     static DRIVES: OnceLock<Mutex<HashMap<u16, String>>> = OnceLock::new();
     DRIVES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// A free drive letter, from Z: down. Ones we already picked are skipped:
-/// `net use` has not created them yet, so the filesystem cannot see them.
+/// A free drive letter, from Z: down. Ones we already picked are skipped: `net use` has.
 fn free_drive_letter(taken: &HashMap<u16, String>) -> Option<String> {
     ('D'..='Z').rev().map(|c| format!("{c}:")).find(|d| {
         !taken.values().any(|t| t == d) && !std::path::Path::new(&format!("{d}\\")).exists()
     })
 }
 
-/// Feed an inbound peer response to whichever WebDAV request awaits it (by
-/// `request_id`). Returns the message back if nobody does — so a caller's
-/// router chain can route it elsewhere.
 pub fn feed_response(msg: nodeinnet_p2p::P2pMessage) -> Option<nodeinnet_p2p::P2pMessage> {
     use nodeinnet_p2p::P2pMessage as M;
     let id = match &msg {
@@ -211,16 +184,11 @@ pub fn feed_response(msg: nodeinnet_p2p::P2pMessage) -> Option<nodeinnet_p2p::P2
         | M::DeleteEntryResponse { request_id, .. }
         | M::RenameEntryResponse { request_id, .. }
         | M::SetPermissionsResponse { request_id, .. } => *request_id,
-        // Byte transfers are keyed by `transfer_id`, not `request_id`. Without
-        // these two the waiter in `fs.rs` is never woken at all: a read through
-        // the mount blocks on a reply that cannot reach it, and an upload has no
-        // way to learn it was accepted.
         M::FileTransferResponse { transfer_id, .. } | M::FileTransferComplete { transfer_id, .. } => {
             *transfer_id
         }
         _ => return Some(msg),
     };
-    // `get`, not `remove`: the waiter's guard owns the entry's lifetime now.
     let tx = get_pending_requests().lock().unwrap().get(&id).cloned();
     match tx {
         Some(tx) => {
@@ -231,9 +199,6 @@ pub fn feed_response(msg: nodeinnet_p2p::P2pMessage) -> Option<nodeinnet_p2p::P2
     }
 }
 
-/// Ask the OS to mount (or, when `mount == false`, unmount) the WebDAV endpoint
-/// on `port` as a real drive — the step that makes it appear in Finder/Explorer.
-/// Detached + best-effort; skipped under `NODEINNET_SKIP_OS_MOUNT` (test runs).
 fn os_mount(port: u16, mount: bool, creds: Option<(String, String)>, secret: Option<String>) {
     if std::env::var("NODEINNET_SKIP_OS_MOUNT").is_ok() {
         return;
@@ -249,7 +214,6 @@ fn os_mount(port: u16, mount: bool, creds: Option<(String, String)>, secret: Opt
         }
         if cfg!(target_os = "macos") {
             if mount {
-                // Finder appends -1, -2 … when the name is taken, so ask for it.
                 let script = format!(
                     "set d to (mount volume \"{http}\")\n\
                      return POSIX path of (d as alias)"
@@ -289,7 +253,6 @@ fn os_mount(port: u16, mount: bool, creds: Option<(String, String)>, secret: Opt
                     }
                 }
             } else {
-                // Only our letter: a wildcard drops every network drive.
                 let drive = mapped_drives().lock().unwrap().remove(&port);
                 if let Some(drive) = drive {
                     let _ = std::process::Command::new("net")
@@ -314,14 +277,11 @@ fn home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
-/// The `dav://` and `http://` URLs per port, for callers that know only the port.
 fn mount_uris() -> &'static Mutex<HashMap<u16, (String, String)>> {
     static URIS: OnceLock<Mutex<HashMap<u16, (String, String)>>> = OnceLock::new();
     URIS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The `dav://` URL a mount is reached by, secret included. Every file manager
-/// takes a plain URL, so this works the same on KDE, GNOME and Finder.
 fn dav_uri(port: u16, secret: &Option<String>) -> String {
     match secret {
         Some(s) => format!("dav://localhost:{port}/{s}/"),
@@ -329,7 +289,6 @@ fn dav_uri(port: u16, secret: &Option<String>) -> String {
     }
 }
 
-/// Same location over plain HTTP, for the mount helpers that want a URL.
 fn http_uri(port: u16, secret: &Option<String>) -> String {
     match secret {
         Some(s) => format!("http://127.0.0.1:{port}/{s}/"),
@@ -337,9 +296,6 @@ fn http_uri(port: u16, secret: &Option<String>) -> String {
     }
 }
 
-/// Add or remove a KDE Dolphin Places bookmark (`user-places.xbel`) for the
-/// mount. KDE-only: skipped unless the file exists — GNOME's gio mount already
-/// shows the disk, and macOS/Windows have no such file.
 fn set_kde_place(port: u16, add: bool, secret: &Option<String>) {
     let Some(path) = home().map(|h| h.join(".local/share/user-places.xbel")) else {
         return;
@@ -348,8 +304,6 @@ fn set_kde_place(port: u16, add: bool, secret: &Option<String>) {
         return;
     };
     let uri = dav_uri(port, secret);
-    // Matched on the port: the stored href carries a secret the unmount path
-    // no longer has.
     let mut content = remove_xbel_entry(&content, port);
     if add {
         let block = format!(
@@ -382,9 +336,6 @@ fn remove_xbel_entry(content: &str, port: u16) -> String {
     out
 }
 
-/// Start (or reuse) a WebDAV server exposing resource `resource_id`, then ask
-/// the OS to mount it. `net_tx` is where the server's outbound P2P requests are
-/// forwarded (the caller bridges it to the target peer). Returns the port.
 pub fn mount_resource(
     resource_id: String,
     drive_name: String,
@@ -395,7 +346,6 @@ pub fn mount_resource(
     }
     let port = free_port()?;
 
-    // The dav FS emits bare P2pMessages on `p2p_tx`; forward each to the peer.
     let (p2p_tx, mut p2p_rx) = tokio::sync::mpsc::channel::<nodeinnet_p2p::P2pMessage>(32);
     let mut drives = HashMap::new();
     drives.insert(
@@ -407,16 +357,11 @@ pub fn mount_resource(
         last_access: Instant::now(),
         drives,
     }));
-    // The server is on loopback, which every local process can reach, so the
-    // mount is guarded either way. Windows takes Digest, which its own mount
-    // helper supplies. Unix file managers have no portable way to hand over a
-    // credential, so there the guard is an unguessable path instead.
+    // The server is on loopback, which every local process can reach, so the mount is.
     let windows = cfg!(target_os = "windows");
     let creds = windows.then(|| ("nodeinnet".to_string(), Uuid::new_v4().simple().to_string()));
     let secret = (!windows).then(|| Uuid::new_v4().simple().to_string());
     let prefix = MountPrefix(secret.as_ref().map(|s| format!("/{s}")).unwrap_or_default());
-    // Recorded before anything is spawned: opening the file manager can happen
-    // the instant the mount appears, and os_mount sleeps before it runs.
     mount_uris()
         .lock()
         .unwrap()
@@ -485,7 +430,6 @@ pub fn mount_resource(
     }
 }
 
-/// Stop the WebDAV server for `resource_id` and unmount it from the OS.
 pub fn unmount_resource(resource_id: &str) {
     if let Some(m) = mounts().lock().unwrap().remove(resource_id) {
         let handle = m.handle;
@@ -496,9 +440,6 @@ pub fn unmount_resource(resource_id: &str) {
     }
 }
 
-/// Stop every live WebDAV server and unmount it from the OS — called on app
-/// shutdown so no gvfs/Explorer/Finder mounts (or actix threads) survive the
-/// process. Best-effort; drains the registry so a second call is a no-op.
 pub fn unmount_all() {
     let drained: Vec<MountedServer> = mounts().lock().unwrap().drain().map(|(_, m)| m).collect();
     for m in drained {
@@ -510,15 +451,10 @@ pub fn unmount_all() {
     }
 }
 
-/// Open the OS file manager at a mounted WebDAV endpoint on `port` (best-effort,
-/// detached) — Explorer / Finder / the freedesktop default. Skipped under
-/// `NODEINNET_SKIP_OS_MOUNT` (test runs), mirroring [`os_mount`].
 pub fn open_in_explorer(port: u16) {
     if std::env::var("NODEINNET_SKIP_OS_MOUNT").is_ok() {
         return;
     }
-    // Prefer the real mount point the OS gave us; fall back to the URL, which
-    // every file manager can open on its own.
     let mounted = mapped_drives().lock().unwrap().get(&port).cloned();
     let Some((dav, http)) = mount_uris().lock().unwrap().get(&port).cloned() else {
         return;
@@ -555,7 +491,6 @@ mod tests {
         assert!(path_is_under("/abc123", "/abc123"));
         assert!(path_is_under("/abc123/", "/abc123"));
         assert!(path_is_under("/abc123/dir/file.txt", "/abc123"));
-        // A bare port scan, a near miss, and a sibling sharing the prefix.
         assert!(!path_is_under("/", "/abc123"));
         assert!(!path_is_under("/abc124/file", "/abc123"));
         assert!(!path_is_under("/abc1234", "/abc123"));

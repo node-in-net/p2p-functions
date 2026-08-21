@@ -28,7 +28,6 @@ where
                         let height = guard.height() as usize;
                         let pixels = guard.as_slice();
 
-                        // ScreenCaptureKit already hands back BGRA, what CapturedFrame wants.
                         let bgra_data = pixels.to_vec();
 
                         if self
@@ -68,7 +67,6 @@ pub fn start_macos_capture<F, S>(
             "Initializing macOS ScreenCaptureKit...".to_string(),
         ));
 
-        // Concurrently request/check macOS Accessibility permissions for remote control input simulation
         crate::mouse::check_and_request_accessibility_permissions();
 
         let content = match SCShareableContent::get() {
@@ -130,7 +128,6 @@ pub fn start_macos_capture<F, S>(
             return;
         }
 
-        // Keep capture running until stop flag is set
         while !stop_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

@@ -1,15 +1,3 @@
-//! The capabilities this node serves to its peers.
-//!
-//! An application picks which to serve and installs them once at startup:
-//!
-//! ```no_run
-//! use p2p_handlers::Capabilities;
-//! p2p_handlers::install(Capabilities::FILESYSTEM | Capabilities::NETWORK);
-//! ```
-//!
-//! Both gates must pass: Cargo features decide what is compiled in, and
-//! [`Capabilities`] what this process serves, so one binary can serve different
-//! sets depending on how it was started.
 
 use std::ops::{BitOr, BitOrAssign};
 use std::sync::Arc;
@@ -36,42 +24,29 @@ pub mod terminal;
 #[cfg(feature = "feature-net")]
 pub mod web_proxy;
 
-/// Which capabilities a node serves. Combine them with `|`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Capabilities(u32);
 
 impl Capabilities {
-    /// Serve nothing — a client that only consumes remote resources.
     pub const NONE: Self = Self(0);
-    /// Browse and transfer files in the shared folders.
     pub const FILESYSTEM: Self = Self(1 << 0);
-    /// A remote PTY.
     pub const TERMINAL: Self = Self(1 << 1);
-    /// SOCKS tunnelling and HTTP proxying on the peer's behalf.
     pub const NETWORK: Self = Self(1 << 2);
-    /// The Windows registry. Serves nothing on other platforms.
     pub const REGISTRY: Self = Self(1 << 3);
-    /// Hardware and OS telemetry.
     pub const SYSTEM_INFO: Self = Self(1 << 4);
-    /// Folder synchronisation.
     pub const SYNC_FOLDER: Self = Self(1 << 5);
-    /// Share this machine's screen and accept remote input.
     pub const REMOTE_DESKTOP: Self = Self(1 << 6);
 
-    /// Every defined capability, regardless of which features are compiled in.
     pub const ALL: Self = Self(0b111_1111);
 
-    /// True when every bit of `other` is set here.
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
-    /// The raw bits, for storing a choice in config or passing across FFI.
     pub const fn bits(self) -> u32 {
         self.0
     }
 
-    /// Rebuild from raw bits, ignoring any that are not defined.
     pub const fn from_bits_truncate(bits: u32) -> Self {
         Self(bits & Self::ALL.0)
     }
@@ -90,7 +65,6 @@ impl BitOrAssign for Capabilities {
     }
 }
 
-/// Routes an incoming message to the capability that serves it, if enabled.
 pub struct NodeHandlers {
     enabled: Capabilities,
 }
@@ -177,10 +151,6 @@ impl MessageHandler for NodeHandlers {
     }
 }
 
-/// Serve `enabled` for the rest of this process. Call once, before connecting.
-///
-/// Screen sharing is installed separately from the message handlers because the
-/// transport drives capture itself once a peer is approved.
 pub fn install(enabled: Capabilities) {
     let _ = p2p_node::install_message_handler(Arc::new(NodeHandlers::new(enabled)));
 

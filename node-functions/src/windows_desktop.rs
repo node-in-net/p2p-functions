@@ -50,7 +50,6 @@ where
         let mut frame_buf = frame.buffer()?;
         let raw_pixels = frame_buf.as_raw_buffer();
 
-        // Graphics Capture hands back RGBA; CapturedFrame is BGRA.
         let mut bgra_data = vec![0u8; width * height * 4];
         for i in (0..raw_pixels.len()).step_by(4) {
             if i + 3 < raw_pixels.len() {

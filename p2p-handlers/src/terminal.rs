@@ -26,7 +26,6 @@ pub async fn handle_terminal_message(p2p_msg: P2pMessage, ctx: NodeContext) {
 
                     let session_id = uuid::Uuid::new_v4();
 
-                    // Track the session for input routing and resizing
                     ctx.active_terminals.lock().await.insert(
                         resource_id.clone(),
                         (session.input_tx, session.resize_tx, session_id),
@@ -44,7 +43,7 @@ pub async fn handle_terminal_message(p2p_msg: P2pMessage, ctx: NodeContext) {
         }
         P2pMessage::StopTerminal { resource_id } => {
             ctx.log("🛑 Peer stopped terminal session.");
-            // Removing from the map drops the Sender (input_tx), which gracefully kills the PTY child proc in node-functions
+            // Removing from the map drops the Sender (input_tx), which gracefully kills the PTY.
             ctx.active_terminals.lock().await.remove(&resource_id);
         }
         P2pMessage::TerminalInput { resource_id, data } => {

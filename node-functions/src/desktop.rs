@@ -16,7 +16,6 @@ pub struct CapturedFrame {
     pub height: usize,
 }
 
-// Target-conditional modules with path override to resolve them in src/
 #[cfg(all(target_os = "linux", feature = "screen-capture"))]
 #[path = "linux_desktop.rs"]
 pub mod linux_desktop;
@@ -33,11 +32,6 @@ pub mod macos_desktop;
 #[path = "synthetic_desktop.rs"]
 pub mod synthetic_desktop;
 
-/// Starts a target-specific desktop capture stream.
-///
-/// * `stop_flag` - Atomic trigger to abort/stop capture.
-/// * `frame_callback` - Invoked on every captured frame.
-/// * `status_callback` - Invoked for setup phases, errors, and termination.
 pub fn start_desktop_stream<F, S>(
     stop_flag: Arc<AtomicBool>,
     force_select: bool,

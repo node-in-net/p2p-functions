@@ -15,7 +15,6 @@ pub enum WebProxyEvent {
 
 const MAX_REDIRECTS: usize = 10;
 
-/// A client pinned to the addresses `net_guard` approved for this URL's host.
 async fn client_for(url: &reqwest::Url, allow_local: bool) -> Result<Client, String> {
     let host = url.host_str().ok_or("URL has no host")?;
     let port = url
@@ -24,7 +23,6 @@ async fn client_for(url: &reqwest::Url, allow_local: bool) -> Result<Client, Str
     let addrs = crate::net_guard::resolve_allowed(host, port, allow_local).await?;
 
     Client::builder()
-        // Followed by hand: reqwest would chase a Location into the LAN.
         .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(host, &addrs)
         .build()
@@ -96,7 +94,6 @@ pub async fn execute_proxied_request(
 
         match next {
             Some(next) => {
-                // 307/308 keep the method and body; the older codes turn into GET.
                 if !matches!(hop.status().as_u16(), 307 | 308) {
                     req_method = Method::GET;
                     body = None;
@@ -121,7 +118,6 @@ pub async fn execute_proxied_request(
     let status = resp.status().as_u16();
     let mut resp_headers = BTreeMap::new();
     for (k, v) in resp.headers().iter() {
-        // Stripped so the peer can render the page in an embedded view.
         let lower_k = k.as_str().to_lowercase();
         if lower_k == "x-frame-options"
             || lower_k == "content-security-policy"

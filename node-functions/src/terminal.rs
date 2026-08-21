@@ -5,7 +5,6 @@ use tokio::sync::mpsc;
 pub struct PtySession {
     pub input_tx: mpsc::Sender<Vec<u8>>,
     pub output_rx: mpsc::Receiver<Vec<u8>>,
-    /// Send (rows, cols) to resize the PTY (the child gets SIGWINCH and redraws).
     pub resize_tx: mpsc::Sender<(u16, u16)>,
 }
 
@@ -40,16 +39,8 @@ pub fn spawn_pty_command(args: Vec<String>, cwd: Option<String>) -> Result<PtySe
     if let Some(dir) = cwd {
         cmd.cwd(dir);
     }
-    // Without TERM, full-screen TUIs like mc/vim refuse to start
-    // ("TERM environment variable is unset").
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    // macOS: GUI processes don't inherit a shell locale, so the PTY starts with
-    // locale "C" — ncurses apps (mc) then fall back to DEC ACS line-drawing
-    // (ESC(0 + q/x/l…), which a VT renderer must translate or frames come out
-    // as letters. A UTF-8 locale makes them send real ─│┌ directly.
-    // Linux inherits a proper locale from the session; Windows doesn't use locale
-    // this way — so macOS only. Respect an already-set locale.
     if cfg!(target_os = "macos")
         && std::env::var("LANG").map(|v| v.is_empty()).unwrap_or(true)
         && std::env::var("LC_ALL")
@@ -82,12 +73,10 @@ pub fn spawn_pty_command(args: Vec<String>, cwd: Option<String>) -> Result<PtySe
     let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(32);
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u16, u16)>(8);
 
-    // Move slave and master into the background task so they live until the session ends
     let mut slave_holder = Some(pair.slave);
     let mut master_holder = Some(pair.master);
     let mut writer_holder = Some(writer);
 
-    // Background write and process teardown
     tokio::spawn(async move {
         let mut child = child;
 
@@ -108,9 +97,6 @@ pub fn spawn_pty_command(args: Vec<String>, cwd: Option<String>) -> Result<PtySe
                             }
                         }
                         None => {
-                            // Every input_tx clone was dropped: the session is over
-                            // Drop every PTY descriptor BEFORE waiting for the process to exit,
-                            // so conhost.exe does not hang on open PTY references.
                             drop(slave_holder.take());
                             drop(master_holder.take());
                             drop(writer_holder.take());
@@ -183,12 +169,10 @@ mod tests {
         for _ in 0..16 {
             let session = spawn_pty_session(None).expect("Failed to spawn PTY session");
 
-            // Arc<Mutex<Option<Sender>>> so the test can break the reference cycle
             let input_tx_opt = Arc::new(std::sync::Mutex::new(Some(session.input_tx.clone())));
             let input_tx_clone = input_tx_opt.clone();
             let mut rx = session.output_rx;
 
-            // Task reading the output and auto-answering \x1b[6n
             let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
             tokio::spawn(async move {
                 while let Some(data) = rx.recv().await {
@@ -206,10 +190,8 @@ mod tests {
                 }
             });
 
-            // Wait for the process to start
             sleep(Duration::from_millis(500)).await;
 
-            // Drain the shell banner so `response` holds only the echo reply
             while done_rx.try_recv().is_ok() {}
 
             let cmd = b"echo test_command_123\r\n";
@@ -231,13 +213,10 @@ mod tests {
                 "Output did not contain echo response!"
             );
 
-            // Clear the cloned Sender in the task, breaking the cycle
             *input_tx_opt.lock().unwrap() = None;
 
-            // End the session by dropping the main Sender
             drop(session.input_tx);
 
-            // The forwarding task ends when output_rx closes, closing done_rx
             let mut closed = false;
             for _ in 0..10 {
                 if done_rx.recv().await.is_none() {

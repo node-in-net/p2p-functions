@@ -56,7 +56,6 @@ mod tests {
     #[test]
     fn parse_digest_header_empty_returns_empty_map() {
         let map = parse_digest_header("");
-        // Empty input has no '=' so split_once returns None → no entries
         assert!(
             map.is_empty() || map.len() <= 1,
             "should not produce spurious entries"
@@ -214,7 +213,6 @@ mod tests {
         );
     }
 
-    /// Builds the `Authorization: Digest` a compliant client would send.
     fn digest_for(
         username: &str,
         password: &str,
@@ -258,9 +256,7 @@ pub async fn basic_validator(
     Err((actix_web::error::ErrorUnauthorized("Unauthorized"), req))
 }
 
-// --- Manual Digest Auth Implementation ---
 
-/// How long a challenge stays usable.
 const NONCE_TTL: Duration = Duration::from_secs(300);
 
 struct NonceState {
@@ -288,7 +284,6 @@ pub fn issue_nonce() -> String {
     nonce
 }
 
-/// True only for a nonce we issued, unexpired, whose counter moved forward.
 fn accept_nonce(nonce: &str, nc: Option<&str>) -> bool {
     let mut map = issued_nonces().lock().unwrap();
     map.retain(|_, s| s.issued.elapsed() < NONCE_TTL);
@@ -305,7 +300,6 @@ fn accept_nonce(nonce: &str, nc: Option<&str>) -> bool {
                 _ => false,
             }
         }
-        // No qop means no counter, so the nonce is good for one request.
         None => map.remove(nonce).is_some(),
     }
 }
@@ -348,7 +342,6 @@ pub fn parse_digest_auth(req: &actix_web::HttpRequest) -> Result<DigestAuth, Err
             }
         }
     }
-    // Generate challenge if missing or invalid
     let nonce = issue_nonce();
     let challenge = format!(
         "Digest realm=\"NodeInNet\", nonce=\"{}\", algorithm=MD5, qop=\"auth\"",
