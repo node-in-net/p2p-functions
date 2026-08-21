@@ -677,10 +677,30 @@ impl DavFile for NodeInNetDavFile {
                     transfer_id,
                     permissions: None,
                 };
+                // Wait to be told the transfer exists instead of guessing how
+                // long that takes. The old fixed 200 ms was both a race — chunks
+                // arriving before the peer registered `transfer_id` are dropped
+                // without a word — and a toll paid on every single file.
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                {
+                    let mut pending = crate::get_pending_requests().lock().unwrap();
+                    pending.insert(transfer_id, tx);
+                }
+                let _pending_guard = crate::PendingGuard(transfer_id);
+
                 let _ = p2p_tx.send(req).await;
 
-                // Small delay so the remote node has time to create the file
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                match rx.recv().await {
+                    Some(nodeinnet_p2p::P2pMessage::FileTransferResponse {
+                        status: nodeinnet_p2p::FileTransferStatus::Accepted { .. },
+                        ..
+                    }) => {}
+                    Some(nodeinnet_p2p::P2pMessage::FileTransferResponse {
+                        status: nodeinnet_p2p::FileTransferStatus::Rejected { .. },
+                        ..
+                    }) => return Err(FsError::Forbidden),
+                    _ => return Err(FsError::GeneralFailure),
+                }
 
                 if !data.is_empty() {
                     let chunk_size = 16 * 1024;
@@ -691,11 +711,12 @@ impl DavFile for NodeInNetDavFile {
                             offset: offset as u64,
                             data: chunk_data.to_vec(),
                         };
+                        // `send` on a bounded queue waits for room, and the
+                        // transport below paces itself off the SCTP buffer. A
+                        // fixed per-chunk delay on top of that only cost time:
+                        // 2 ms per 16 KiB is about two minutes per gigabyte.
                         let _ = p2p_tx.send(chunk).await;
                         offset += chunk_data.len();
-
-                        // Small delay to avoid overflowing the WebRTC buffer
-                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                     }
                 }
 

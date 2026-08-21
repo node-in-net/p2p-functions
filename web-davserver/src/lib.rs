@@ -211,6 +211,13 @@ pub fn feed_response(msg: nodeinnet_p2p::P2pMessage) -> Option<nodeinnet_p2p::P2
         | M::DeleteEntryResponse { request_id, .. }
         | M::RenameEntryResponse { request_id, .. }
         | M::SetPermissionsResponse { request_id, .. } => *request_id,
+        // Byte transfers are keyed by `transfer_id`, not `request_id`. Without
+        // these two the waiter in `fs.rs` is never woken at all: a read through
+        // the mount blocks on a reply that cannot reach it, and an upload has no
+        // way to learn it was accepted.
+        M::FileTransferResponse { transfer_id, .. } | M::FileTransferComplete { transfer_id, .. } => {
+            *transfer_id
+        }
         _ => return Some(msg),
     };
     // `get`, not `remove`: the waiter's guard owns the entry's lifetime now.
