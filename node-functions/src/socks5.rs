@@ -23,10 +23,10 @@ pub async fn start_socks_client(
                         Ok(0) => break, // EOF
                         Ok(n) => {
                             if read_task_tx.send(buf[..n].to_vec()).await.is_err() {
-                                break; // Receiver dropped, stop reading
+                                break;
                             }
                         }
-                        Err(_) => break, // Error, stop reading
+                        Err(_) => break,
                     }
                 }
             });
@@ -34,7 +34,7 @@ pub async fn start_socks_client(
             let write_task = tokio::spawn(async move {
                 while let Some(data) = local_rx.recv().await {
                     if tx_tcp.write_all(&data).await.is_err() {
-                        break; // Connection broken, stop writing
+                        break;
                     }
                 }
             });

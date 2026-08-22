@@ -119,7 +119,7 @@ pub fn create_registry_key(parent_path: &str, key_name: &str) -> Result<(), Stri
         "HKCR" => RegKey::predef(HKEY_CLASSES_ROOT),
         "HKU" => RegKey::predef(HKEY_USERS),
         "HKCC" => RegKey::predef(HKEY_CURRENT_CONFIG),
-        _ => RegKey::predef(HKEY_CURRENT_USER), // Fallback
+        _ => RegKey::predef(HKEY_CURRENT_USER),
     };
     let rest = if parts.len() > 1 {
         parts[1].replace("/", "\\")
