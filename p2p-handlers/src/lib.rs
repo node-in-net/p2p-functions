@@ -151,13 +151,10 @@ impl MessageHandler for NodeHandlers {
     }
 }
 
-/// What the host has already read out of its own configuration. This crate owns
-/// no config and opens no file; whatever it needs arrives here.
+/// This crate owns no config and opens no file; whatever it needs arrives here.
 #[derive(Default)]
 pub struct HostSettings {
-    /// Screencast restore token, so the portal does not re-prompt for a source.
     pub screencast_restore_token: Option<String>,
-    /// Called when the portal issues a new token; the host decides where it goes.
     pub on_screencast_restore_token: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 

@@ -7,7 +7,6 @@ use client_core::desktop::{
 };
 use nodeinnet_p2p::DesktopInputEvent;
 
-/// Both fields come from the host: this crate never reads a config of its own.
 #[derive(Default)]
 pub struct SystemDesktop {
     restore_token: Option<String>,
