@@ -15,6 +15,8 @@ use crate::desktop::{CapturedFrame, DesktopStreamStatus};
 pub fn start_linux_capture<F, S>(
     stop_flag: Arc<AtomicBool>,
     force_select: bool,
+    restore_token: Option<String>,
+    on_restore_token: Arc<dyn Fn(String) + Send + Sync>,
     frame_callback: Arc<F>,
     status_callback: Arc<S>,
 ) where
@@ -72,12 +74,7 @@ pub fn start_linux_capture<F, S>(
             }
         };
 
-        let config = client_config::AppConfig::new("nodeinnet");
-        let restore_token: Option<String> = if force_select {
-            None
-        } else {
-            config.get::<String>("rtc.screencast_restore_token")
-        };
+        let restore_token = if force_select { None } else { restore_token };
 
         if let Err(e) = screencast_portal
             .select_sources(
@@ -106,8 +103,7 @@ pub fn start_linux_capture<F, S>(
             Ok(request) => match request.response() {
                 Ok(streams) => {
                     if let Some(token) = streams.restore_token() {
-                        config.set("rtc.screencast_restore_token", token);
-                        config.save();
+                        on_restore_token(token.to_string());
                     }
                     streams
                 }

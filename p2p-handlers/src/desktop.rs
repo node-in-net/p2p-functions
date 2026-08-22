@@ -7,8 +7,24 @@ use client_core::desktop::{
 };
 use nodeinnet_p2p::DesktopInputEvent;
 
+/// Both fields come from the host: this crate never reads a config of its own.
 #[derive(Default)]
-pub struct SystemDesktop;
+pub struct SystemDesktop {
+    restore_token: Option<String>,
+    on_restore_token: Option<Arc<dyn Fn(String) + Send + Sync>>,
+}
+
+impl SystemDesktop {
+    pub fn new(
+        restore_token: Option<String>,
+        on_restore_token: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    ) -> Self {
+        Self {
+            restore_token,
+            on_restore_token,
+        }
+    }
+}
 
 impl DesktopProvider for SystemDesktop {
     fn start_capture(
@@ -18,9 +34,15 @@ impl DesktopProvider for SystemDesktop {
         on_frame: FrameCallback,
         on_status: StatusCallback,
     ) {
+        let sink: Arc<dyn Fn(String) + Send + Sync> = match &self.on_restore_token {
+            Some(sink) => sink.clone(),
+            None => Arc::new(|_| {}),
+        };
         node_functions::desktop::start_desktop_stream(
             stop_flag,
             force_select,
+            self.restore_token.clone(),
+            sink,
             move |f: node_functions::desktop::CapturedFrame| {
                 on_frame(CapturedFrame {
                     data: f.data,

@@ -35,6 +35,8 @@ pub mod synthetic_desktop;
 pub fn start_desktop_stream<F, S>(
     stop_flag: Arc<AtomicBool>,
     force_select: bool,
+    restore_token: Option<String>,
+    on_restore_token: Arc<dyn Fn(String) + Send + Sync>,
     frame_callback: F,
     status_callback: S,
 ) where
@@ -44,7 +46,7 @@ pub fn start_desktop_stream<F, S>(
     let stop_flag_clone = stop_flag.clone();
     let frame_cb = Arc::new(frame_callback);
     let status_cb = Arc::new(status_callback);
-    let _ = force_select;
+    let _ = (force_select, &restore_token, &on_restore_token);
 
     #[cfg(feature = "synthetic-capture")]
     {
@@ -62,6 +64,8 @@ pub fn start_desktop_stream<F, S>(
         linux_desktop::start_linux_capture(
             stop_flag_clone,
             force_select,
+            restore_token,
+            on_restore_token,
             frame_cb_inner,
             status_cb_inner,
         );

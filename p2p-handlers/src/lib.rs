@@ -151,12 +151,26 @@ impl MessageHandler for NodeHandlers {
     }
 }
 
-pub fn install(enabled: Capabilities) {
+/// What the host has already read out of its own configuration. This crate owns
+/// no config and opens no file; whatever it needs arrives here.
+#[derive(Default)]
+pub struct HostSettings {
+    /// Screencast restore token, so the portal does not re-prompt for a source.
+    pub screencast_restore_token: Option<String>,
+    /// Called when the portal issues a new token; the host decides where it goes.
+    pub on_screencast_restore_token: Option<Arc<dyn Fn(String) + Send + Sync>>,
+}
+
+pub fn install(enabled: Capabilities, settings: HostSettings) {
     let _ = p2p_node::install_message_handler(Arc::new(NodeHandlers::new(enabled)));
+    let _ = &settings;
 
     #[cfg(feature = "feature-rdesk")]
     if enabled.contains(Capabilities::REMOTE_DESKTOP) {
-        let _ = client_core::desktop::install_desktop_provider(Arc::new(desktop::SystemDesktop));
+        let _ = client_core::desktop::install_desktop_provider(Arc::new(desktop::SystemDesktop::new(
+            settings.screencast_restore_token,
+            settings.on_screencast_restore_token,
+        )));
     }
 }
 
