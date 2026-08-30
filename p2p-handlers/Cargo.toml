@@ -1,0 +1,38 @@
+[package]
+name = "p2p-handlers"
+version = "0.1.286"
+edition = "2021"
+description = "Capabilities a node serves to its peers: filesystem, terminal, registry, remote desktop, SOCKS and web proxy, folder sync, system info"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/node-in-net/p2p-functions"
+publish = false
+
+[dependencies]
+p2p-node = { workspace = true }
+client-core = { workspace = true, default-features = false }
+nodeinnet-p2p = { workspace = true }
+node-functions = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+async-trait = "0.1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { version = "1.8", features = ["v4"] }
+
+[features]
+default = [
+    "feature-fm",
+    "feature-sync",
+    "feature-net",
+    "feature-terminal",
+    "feature-sysinfo",
+    "feature-registry",
+    "feature-rdesk",
+]
+
+feature-fm = []
+feature-sync = []
+feature-net = []
+feature-terminal = []
+feature-sysinfo = []
+feature-registry = []
+feature-rdesk = ["client-core/feature-rdesk", "node-functions/screen-capture"]
