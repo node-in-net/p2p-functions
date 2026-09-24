@@ -162,15 +162,36 @@ pub async fn duplicate_local_entry(source: &Path, dest: &Path) -> Result<(), Str
 pub async fn start_local_download(
     target_file: PathBuf,
     tx: tokio_mpsc::Sender<Result<Vec<u8>, String>>,
+    offset: u64,
+    length: Option<u64>,
 ) -> Result<u64, String> {
     let safe_target = sanitize_windows_path(&target_file);
     match tokio::fs::File::open(&safe_target).await {
         Ok(mut file) => {
-            let total_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+            let file_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+            if offset > file_size {
+                return Err(format!(
+                    "asked to start at {offset}, but the file is {file_size} bytes"
+                ));
+            }
+            if offset > 0 {
+                use tokio::io::AsyncSeekExt;
+                file.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            let rest = file_size - offset;
+            let sending = length.map(|wanted| wanted.min(rest)).unwrap_or(rest);
             tokio::spawn(async move {
                 let mut buffer = vec![0u8; 16 * 1024];
+                let mut left = sending;
                 loop {
-                    match file.read(&mut buffer).await {
+                    if left == 0 {
+                        let _ = tx.send(Ok(Vec::new())).await;
+                        break;
+                    }
+                    let room = buffer.len().min(left as usize);
+                    match file.read(&mut buffer[..room]).await {
                         Ok(0) => {
                             let _ = tx.send(Ok(Vec::new())).await;
                             break;
@@ -179,6 +200,7 @@ pub async fn start_local_download(
                             if tx.send(Ok(buffer[..n].to_vec())).await.is_err() {
                                 break;
                             }
+                            left -= n as u64;
                         }
                         Err(e) => {
                             let _ = tx.send(Err(e.to_string())).await;
@@ -187,7 +209,7 @@ pub async fn start_local_download(
                     }
                 }
             });
-            Ok(total_size)
+            Ok(sending)
         }
         Err(e) => Err(e.to_string()),
     }
@@ -485,6 +507,81 @@ mod tests {
         assert_eq!(&content[5..10], b"world");
     }
 
+    async fn collect(mut rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>) -> Vec<u8> {
+        let mut received = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            let data = chunk.expect("a chunk rather than an error");
+            if data.is_empty() {
+                break;
+            }
+            received.extend_from_slice(&data);
+        }
+        received
+    }
+
+    #[tokio::test]
+    async fn three_digits_from_the_middle_arrive_without_the_rest() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("digits.txt");
+        fs::write(&file, b"1234567890").unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let sending = start_local_download(file, tx, 4, Some(3)).await.unwrap();
+        assert_eq!(sending, 3, "it promised more than the stretch that was asked for");
+        assert_eq!(collect(rx).await, b"567");
+    }
+
+    #[tokio::test]
+    async fn a_stretch_that_runs_past_the_end_stops_at_the_end() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("digits.txt");
+        fs::write(&file, b"1234567890").unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let sending = start_local_download(file, tx, 7, Some(999)).await.unwrap();
+        assert_eq!(sending, 3);
+        assert_eq!(collect(rx).await, b"890");
+    }
+
+    #[tokio::test]
+    async fn without_a_length_it_sends_the_rest_of_the_file() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("digits.txt");
+        fs::write(&file, b"1234567890").unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let sending = start_local_download(file, tx, 6, None).await.unwrap();
+        assert_eq!(sending, 4);
+        assert_eq!(collect(rx).await, b"7890");
+    }
+
+    #[tokio::test]
+    async fn starting_past_the_end_is_refused_rather_than_answered_with_nothing() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("digits.txt");
+        fs::write(&file, b"1234567890").unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let refused = start_local_download(file, tx, 20, Some(1)).await;
+        assert!(refused.is_err(), "it accepted a start beyond the file");
+    }
+
+    /// A stretch longer than one chunk still stops where it was told to.
+    #[tokio::test]
+    async fn a_stretch_spanning_several_chunks_is_cut_to_length() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("big.bin");
+        let body: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&file, &body).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let sending = start_local_download(file, tx, 1_000, Some(40_000))
+            .await
+            .unwrap();
+        assert_eq!(sending, 40_000);
+        assert_eq!(collect(rx).await, body[1_000..41_000]);
+    }
+
     #[tokio::test]
     async fn start_local_download_streams_file() {
         let dir = tempdir().unwrap();
@@ -492,7 +589,7 @@ mod tests {
         fs::write(&file, b"hello world").unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let size = start_local_download(file, tx).await.unwrap();
+        let size = start_local_download(file, tx, 0, None).await.unwrap();
         assert_eq!(size, 11);
 
         let mut received = Vec::new();

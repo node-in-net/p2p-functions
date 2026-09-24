@@ -91,6 +91,8 @@ impl DavFileSystem for NodeInNetDavFs {
                         resource_id,
                         file_path: sub_path,
                         transfer_id,
+                        offset: 0,
+                        length: None,
                     };
 
                     let _ = this.p2p_tx.send(msg).await;

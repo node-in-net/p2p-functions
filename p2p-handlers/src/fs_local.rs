@@ -472,6 +472,8 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
             resource_id,
             file_path,
             transfer_id,
+            offset,
+            length,
         } => {
             let ctx_clone = ctx.clone();
             tokio::spawn(async move {
@@ -493,7 +495,7 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
 
                 let (tx, mut rx) =
                     tokio_mpsc::channel(client_core::limits::outbound_queue_slots(16 * 1024));
-                match fs_local::start_local_download(target_file, tx).await {
+                match fs_local::start_local_download(target_file, tx, offset, length).await {
                     Ok(total_size) => {
                         ctx_clone
                             .send_msg(P2pMessage::FileTransferResponse {
@@ -580,7 +582,7 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                         let (tx, mut rx) = tokio_mpsc::channel(
                             client_core::limits::outbound_queue_slots(16 * 1024),
                         );
-                        if fs_local::start_local_download(local_path.clone(), tx)
+                        if fs_local::start_local_download(local_path.clone(), tx, 0, None)
                             .await
                             .is_ok()
                         {
