@@ -8,21 +8,21 @@ repository = "https://github.com/node-in-net/p2p-functions"
 publish = false
 
 [dependencies]
-tokio = { workspace = true, features = ["full"] }
-sysinfo = "0.29"
-network-interface = "1.1.1"
-nodeinnet-p2p = { workspace = true }
-portable-pty = "0.9.0"
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "stream"] }
-walkdir = "2.5.0"
-md5 = "0.8.0"
-serde_json = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
+tokio = { version = "1.36", features = ["full"] }
+sysinfo = { version = "0.29", optional = true }
+network-interface = { version = "1.1.1", optional = true }
+nodeinnet-p2p = { git = "https://github.com/node-in-net/p2p-common", branch = "main" }
+portable-pty = { version = "0.9.0", optional = true }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "stream"], optional = true }
+walkdir = { version = "2.5.0", optional = true }
+md5 = { version = "0.8.0", optional = true }
+serde_json = { version = "1.0", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
 chrono = "0.4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture = { version = "2.0", optional = true }
-winreg = "0.52"
+winreg = { version = "0.52", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.9", optional = true }
@@ -33,16 +33,24 @@ gstreamer-app = { package = "gstreamer-app", version = "0.22", optional = true }
 screencapturekit = { version = "1.5.4", optional = true }
 
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
-screenshots = "0.8"
+screenshots = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { workspace = true, features = ["full"] }
+tokio = { version = "1.36", features = ["full"] }
 
 [features]
-default = ["screen-capture"]
-screen-capture = ["dep:ashpd", "dep:gstreamer", "dep:gstreamer-app", "dep:windows-capture", "dep:screencapturekit"]
+default = ["all", "screen-capture"]
+all = ["fs", "terminal", "sysinfo", "net", "sync", "registry", "desktop"]
+fs = []
+terminal = ["dep:portable-pty"]
+sysinfo = ["dep:sysinfo", "dep:network-interface"]
+net = ["dep:reqwest", "dep:network-interface"]
+sync = ["dep:walkdir", "dep:md5", "dep:serde_json"]
+registry = ["dep:winreg"]
+desktop = ["dep:screenshots", "dep:serde"]
+screen-capture = ["desktop", "dep:ashpd", "dep:gstreamer", "dep:gstreamer-app", "dep:windows-capture", "dep:screencapturekit"]
 # Test-only: animated frames instead of a real screen, so the rdesk media path
 # runs headlessly. Not in `default`; apps never enable it.
-synthetic-capture = []
+synthetic-capture = ["desktop"]
 

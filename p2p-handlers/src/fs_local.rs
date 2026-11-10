@@ -256,6 +256,8 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                         std::fs::Permissions::from_mode(mode),
                     );
                 }
+                #[cfg(not(unix))]
+                let _ = permissions;
             }
             ctx.send_msg(P2pMessage::CreateDirectoryResponse {
                 request_id,
@@ -395,6 +397,7 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                 }
                 #[cfg(not(unix))]
                 {
+                    let _ = target_entry;
                     Err("Chmod not supported on this platform".to_string())
                 }
             };

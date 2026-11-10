@@ -8,14 +8,14 @@ repository = "https://github.com/node-in-net/p2p-functions"
 publish = false
 
 [dependencies]
-p2p-node = { workspace = true }
-client-core = { workspace = true, default-features = false }
-nodeinnet-p2p = { workspace = true }
-node-functions = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+p2p-node = { git = "https://github.com/node-in-net/p2p-common", branch = "main", default-features = false }
+client-core = { git = "https://github.com/node-in-net/p2p-common", branch = "main", default-features = false }
+nodeinnet-p2p = { git = "https://github.com/node-in-net/p2p-common", branch = "main" }
+node-functions = { path = "../node-functions", default-features = false }
+tokio = { version = "1.36", features = ["full"] }
 async-trait = "0.1"
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 uuid = { version = "1.8", features = ["v4"] }
 
 [features]
@@ -29,10 +29,10 @@ default = [
     "feature-rdesk",
 ]
 
-feature-fm = []
-feature-sync = []
-feature-net = []
-feature-terminal = []
-feature-sysinfo = []
-feature-registry = []
+feature-fm = ["node-functions/fs"]
+feature-sync = ["node-functions/sync"]
+feature-net = ["node-functions/net"]
+feature-terminal = ["node-functions/terminal"]
+feature-sysinfo = ["node-functions/sysinfo"]
+feature-registry = ["node-functions/registry"]
 feature-rdesk = ["client-core/feature-rdesk", "node-functions/screen-capture"]
