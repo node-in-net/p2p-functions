@@ -25,6 +25,52 @@ pub fn resolve_and_sandbox_path(base_path: &Path, user_path: &str) -> Option<Pat
     Some(base_path.join(rel_path))
 }
 
+pub fn stays_within(base_path: &Path, path: &Path) -> bool {
+    let Ok(base) = std::fs::canonicalize(sanitize_windows_path(base_path)) else {
+        return false;
+    };
+    let path: PathBuf = sanitize_windows_path(path).components().collect();
+    canonical_through_existing(&path).is_some_and(|real| real.starts_with(&base))
+}
+
+fn canonical_through_existing(path: &Path) -> Option<PathBuf> {
+    let mut missing = Vec::new();
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let mut real = std::fs::canonicalize(ancestor).ok()?;
+                real.extend(missing.iter().rev());
+                return Some(real);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(ancestor.file_name()?)
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+async fn still_within(
+    file: tokio::fs::File,
+    share_base: &Path,
+    path: &Path,
+) -> Result<tokio::fs::File, String> {
+    if !stays_within(share_base, path) {
+        return Err("The path leads out of the share".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata().await.map_err(|e| e.to_string())?;
+        let named = tokio::fs::metadata(path).await.map_err(|e| e.to_string())?;
+        if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+            return Err("The file was replaced while it was being opened".to_string());
+        }
+    }
+    Ok(file)
+}
+
 pub type DirWithDate = (String, String);
 pub type FileWithDate = (String, u64, String);
 pub type DirectoryListing = (Vec<DirWithDate>, Vec<FileWithDate>);
@@ -167,52 +213,70 @@ pub async fn start_local_download(
 ) -> Result<u64, String> {
     let safe_target = sanitize_windows_path(&target_file);
     match tokio::fs::File::open(&safe_target).await {
-        Ok(mut file) => {
-            let file_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-            if offset > file_size {
-                return Err(format!(
-                    "asked to start at {offset}, but the file is {file_size} bytes"
-                ));
-            }
-            if offset > 0 {
-                use tokio::io::AsyncSeekExt;
-                file.seek(std::io::SeekFrom::Start(offset))
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            let rest = file_size - offset;
-            let sending = length.map(|wanted| wanted.min(rest)).unwrap_or(rest);
-            tokio::spawn(async move {
-                let mut buffer = vec![0u8; 16 * 1024];
-                let mut left = sending;
-                loop {
-                    if left == 0 {
-                        let _ = tx.send(Ok(Vec::new())).await;
-                        break;
-                    }
-                    let room = buffer.len().min(left as usize);
-                    match file.read(&mut buffer[..room]).await {
-                        Ok(0) => {
-                            let _ = tx.send(Ok(Vec::new())).await;
-                            break;
-                        }
-                        Ok(n) => {
-                            if tx.send(Ok(buffer[..n].to_vec())).await.is_err() {
-                                break;
-                            }
-                            left -= n as u64;
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(e.to_string())).await;
-                            break;
-                        }
-                    }
-                }
-            });
-            Ok(sending)
-        }
+        Ok(file) => stream_local_file(file, tx, offset, length).await,
         Err(e) => Err(e.to_string()),
     }
+}
+
+pub async fn open_local_file_within(
+    share_base: &Path,
+    target_file: &Path,
+) -> Result<tokio::fs::File, String> {
+    let safe_target = sanitize_windows_path(target_file);
+    let file = tokio::fs::File::open(&safe_target)
+        .await
+        .map_err(|e| e.to_string())?;
+    still_within(file, share_base, &safe_target).await
+}
+
+pub async fn stream_local_file(
+    mut file: tokio::fs::File,
+    tx: tokio_mpsc::Sender<Result<Vec<u8>, String>>,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<u64, String> {
+    let file_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    if offset > file_size {
+        return Err(format!(
+            "asked to start at {offset}, but the file is {file_size} bytes"
+        ));
+    }
+    if offset > 0 {
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let rest = file_size - offset;
+    let sending = length.map(|wanted| wanted.min(rest)).unwrap_or(rest);
+    tokio::spawn(async move {
+        let mut buffer = vec![0u8; 16 * 1024];
+        let mut left = sending;
+        loop {
+            if left == 0 {
+                let _ = tx.send(Ok(Vec::new())).await;
+                break;
+            }
+            let room = buffer.len().min(left as usize);
+            match file.read(&mut buffer[..room]).await {
+                Ok(0) => {
+                    let _ = tx.send(Ok(Vec::new())).await;
+                    break;
+                }
+                Ok(n) => {
+                    if tx.send(Ok(buffer[..n].to_vec())).await.is_err() {
+                        break;
+                    }
+                    left -= n as u64;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string())).await;
+                    break;
+                }
+            }
+        }
+    });
+    Ok(sending)
 }
 
 pub async fn start_local_upload(
@@ -250,12 +314,35 @@ pub async fn create_local_file(target_path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+pub async fn create_local_file_within(
+    share_base: &Path,
+    target_path: &Path,
+) -> Result<tokio::fs::File, String> {
+    let safe_target = sanitize_windows_path(target_path);
+    let opened = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&safe_target)
+        .await
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&safe_target)
+                .await
+        }
+        opened => opened,
+    };
+    let file = still_within(opened.map_err(|e| e.to_string())?, share_base, &safe_target).await?;
+    file.set_len(0).await.map_err(|e| e.to_string())?;
+    Ok(file)
+}
+
 pub async fn write_local_file_chunk(
     target_path: &Path,
     offset: u64,
     data: &[u8],
 ) -> Result<(), String> {
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
     let safe_target = sanitize_windows_path(target_path);
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
@@ -264,7 +351,15 @@ pub async fn write_local_file_chunk(
         .open(&safe_target)
         .await
         .map_err(|e| e.to_string())?;
+    write_file_chunk(&mut file, offset, data).await
+}
 
+pub async fn write_file_chunk(
+    file: &mut tokio::fs::File,
+    offset: u64,
+    data: &[u8],
+) -> Result<(), String> {
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
     file.seek(std::io::SeekFrom::Start(offset))
         .await
         .map_err(|e| e.to_string())?;
@@ -352,6 +447,84 @@ mod tests {
         assert!(resolve_and_sandbox_path(base, "C:\\Windows\\System32").is_none());
         assert!(resolve_and_sandbox_path(base, "\\\\server\\share").is_none());
         assert!(resolve_and_sandbox_path(base, "\\Windows").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stays_within_follows_links_out_of_the_share() {
+        let root = tempdir().unwrap();
+        let share = root.path().join("share");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(share.join("inner")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, share.join("out")).unwrap();
+        std::os::unix::fs::symlink(outside.join("not-yet"), share.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(share.join("inner"), share.join("in")).unwrap();
+
+        assert!(stays_within(&share, &share));
+        assert!(stays_within(&share, &share.join("inner/new/deeper.txt")));
+        assert!(stays_within(&share, &share.join("in/new.txt")));
+        assert!(!stays_within(&share, &share.join("out")));
+        assert!(!stays_within(&share, &share.join("out/secret")));
+        assert!(!stays_within(&share, &share.join("out/new/deeper.txt")));
+        assert!(!stays_within(&share, &share.join("dangling")));
+        assert!(!stays_within(&share, &share.join("dangling/")));
+        assert!(!stays_within(&share, &share.join("dangling/x")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stays_within_accepts_a_share_that_is_itself_a_link() {
+        let root = tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(stays_within(&link, &link.join("a.txt")));
+        assert!(stays_within(&link, &real.join("a.txt")));
+    }
+
+    #[test]
+    fn stays_within_refuses_a_missing_share() {
+        let root = tempdir().unwrap();
+        let gone = root.path().join("gone");
+        assert!(!stays_within(&gone, &gone.join("a.txt")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_out_of_the_share_is_neither_opened_nor_emptied() {
+        let root = tempdir().unwrap();
+        let share = root.path().join("share");
+        fs::create_dir(&share).unwrap();
+        let outside = root.path().join("outside.txt");
+        fs::write(&outside, b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, share.join("link")).unwrap();
+
+        assert!(create_local_file_within(&share, &share.join("link"))
+            .await
+            .is_err());
+        assert!(open_local_file_within(&share, &share.join("link"))
+            .await
+            .is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn a_file_created_within_the_share_starts_empty() {
+        let share = tempdir().unwrap();
+        let fresh = share.path().join("fresh.txt");
+        let old = share.path().join("old.txt");
+        fs::write(&old, b"old content").unwrap();
+
+        for target in [&fresh, &old] {
+            let mut file = create_local_file_within(share.path(), target)
+                .await
+                .unwrap();
+            write_file_chunk(&mut file, 0, b"new").await.unwrap();
+            assert_eq!(fs::read(target).unwrap(), b"new");
+        }
     }
 
     #[test]
