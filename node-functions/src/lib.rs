@@ -5,6 +5,7 @@ pub mod terminal;
 
 #[cfg(feature = "fs")]
 pub mod fs_local;
+pub mod names;
 #[cfg(feature = "registry")]
 pub mod registry;
 #[cfg(feature = "net")]

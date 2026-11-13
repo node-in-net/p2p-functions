@@ -98,6 +98,14 @@ pub fn compute_sync_diff(
     diffs
 }
 
+fn relative_str(rel_path: &std::path::Path) -> String {
+    rel_path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 pub fn scan_local_resource_folders(
     resources: &[SharedResource],
 ) -> BTreeMap<String, Vec<SyncFileInfo>> {
@@ -123,7 +131,7 @@ pub fn scan_local_resource_folders(
                             let walker = walkdir::WalkDir::new(root_path).into_iter().filter_entry(
                                 move |e| {
                                     if let Ok(rel_path) = e.path().strip_prefix(root_path) {
-                                        let rel_str = rel_path.to_string_lossy().replace("\\", "/");
+                                        let rel_str = relative_str(rel_path);
                                         if rel_str.is_empty() {
                                             return true;
                                         }
@@ -160,8 +168,7 @@ pub fn scan_local_resource_folders(
                                 if path.is_file() {
                                     if let Ok(metadata) = std::fs::metadata(path) {
                                         if let Ok(rel_path) = path.strip_prefix(root_path) {
-                                            let rel_str =
-                                                rel_path.to_string_lossy().replace("\\", "/");
+                                            let rel_str = relative_str(rel_path);
                                             let size = metadata.len();
                                             let last_modified_ms = metadata
                                                 .modified()
@@ -445,5 +452,39 @@ mod tests {
         assert_eq!(result["folder2"].len(), 1);
         assert!(result["folder1"][0].relative_path.contains("a.txt"));
         assert!(result["folder2"][0].relative_path.contains("b.txt"));
+    }
+
+    fn scanned_paths(dir: &std::path::Path) -> Vec<String> {
+        let res = SharedResource {
+            config: Some(serde_json::json!({ "path": dir }).to_string()),
+            ..make_resource("f", "", &[])
+        };
+        let mut paths: Vec<String> = scan_local_resource_folders(&[res])["f"]
+            .iter()
+            .map(|f| f.relative_path.clone())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_stays_part_of_a_unix_name() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("..\\x"), b"x").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/y"), b"y").unwrap();
+
+        assert_eq!(scanned_paths(dir.path()), ["..\\x", "sub/y"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_separator_is_reported_as_a_slash() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub").join("y"), b"y").unwrap();
+
+        assert_eq!(scanned_paths(dir.path()), ["sub/y"]);
     }
 }

@@ -1,4 +1,5 @@
 use node_functions::fs_local;
+use node_functions::names::{folded, Comparison};
 use nodeinnet_p2p::P2pMessage;
 use p2p_node::NodeContext;
 use std::path::{Path, PathBuf};
@@ -97,6 +98,98 @@ fn virtual_parent(local: &Path, share_base: &Path, prefix: &str) -> String {
         (false, true) => prefix.to_string(),
         (false, false) => format!("{prefix}/{rel}"),
     }
+}
+
+fn is_plain_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(only)), None) if only == name
+    ) && !(cfg!(windows) && node_functions::names::windows_refuses(name))
+}
+
+fn windows_refuses_within(share_base: &Path, local: &Path) -> bool {
+    cfg!(windows)
+        && local.strip_prefix(share_base).map_or(true, |rel| {
+            rel.components()
+                .any(|c| node_functions::names::windows_refuses(&c.as_os_str().to_string_lossy()))
+        })
+}
+
+fn stored_as(share_base: &Path, local: &Path) -> Option<PathBuf> {
+    let by = if cfg!(windows) {
+        Comparison::Windows
+    } else if cfg!(any(target_os = "macos", target_os = "android")) {
+        Comparison::MacOs
+    } else {
+        return None;
+    };
+    let mut stored = share_base.to_path_buf();
+    for part in local.strip_prefix(share_base).ok()?.components() {
+        let wanted = part.as_os_str();
+        let wanted_name = wanted.to_string_lossy();
+        let key = folded(&wanted_name, by);
+        let names: Vec<_> = std::fs::read_dir(fs_local::sanitize_windows_path(&stored))
+            .ok()?
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        let name = names
+            .iter()
+            .find(|name| name.as_os_str() == wanted)
+            .or_else(|| {
+                names
+                    .iter()
+                    .find(|name| folded(&name.to_string_lossy(), by) == key)
+            })?;
+        stored.push(name);
+    }
+    Some(stored)
+}
+
+fn already_there(share_base: &Path, wanted: &Path, stored: &Path) -> String {
+    let shown = |path: &Path| {
+        path.strip_prefix(share_base)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    format!(
+        "\"{}\" already exists here as \"{}\"",
+        shown(wanted),
+        shown(stored)
+    )
+}
+
+fn download_path(transfer_id: uuid::Uuid) -> PathBuf {
+    std::env::temp_dir().join(transfer_id.to_string())
+}
+
+async fn write_download_chunk(
+    ctx: &NodeContext,
+    transfer_id: uuid::Uuid,
+    path: &Path,
+    total_size: u64,
+    offset: u64,
+    data: &[u8],
+) -> Result<(), String> {
+    let done = download_path(transfer_id);
+    if path == done {
+        return fs_local::write_local_file_chunk(path, offset, data).await;
+    }
+    let have = tokio::fs::metadata(path).await.map_or(0, |m| m.len());
+    if offset > have {
+        return Err(format!("bytes {have}..{offset} never arrived"));
+    }
+    fs_local::write_local_file_chunk(path, offset, data).await?;
+    if have.max(offset + data.len() as u64) < total_size {
+        return Ok(());
+    }
+    fs_local::rename_local_entry(path, &done).await?;
+    if let Some(download) = ctx.active_downloads.lock().await.get_mut(&transfer_id) {
+        download.0 = done;
+    }
+    Ok(())
 }
 
 pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
@@ -239,7 +332,10 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                     share_base,
                     ..
                 }) => {
-                    if dir_name.contains("..") || dir_name.contains('/') || dir_name.contains('\\')
+                    if dir_name.contains("..")
+                        || dir_name.contains('/')
+                        || dir_name.contains('\\')
+                        || !is_plain_name(&dir_name)
                     {
                         ctx.send_msg(P2pMessage::CreateDirectoryResponse {
                             request_id,
@@ -257,6 +353,16 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                             resource_id,
                             parent_path,
                             result: Err("Cannot create a directory here".to_string()),
+                        })
+                        .await;
+                        return;
+                    }
+                    if let Some(stored) = stored_as(&share_base, &p).filter(|s| *s != p) {
+                        ctx.send_msg(P2pMessage::CreateDirectoryResponse {
+                            request_id,
+                            resource_id,
+                            parent_path,
+                            result: Err(already_there(&share_base, &p, &stored)),
                         })
                         .await;
                         return;
@@ -340,14 +446,15 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                 "📝 Peer requested to rename/move entry: '{}' to '{}'",
                 path, new_path
             ));
-            let (target_entry, parent_path) = match resolve(&ctx, &resource_id, &path) {
+            let (target_entry, target_base, parent_path) = match resolve(&ctx, &resource_id, &path)
+            {
                 Some(Resolved::At {
                     local,
                     share_base,
                     prefix,
                 }) => {
                     let parent = virtual_parent(&local, &share_base, &prefix);
-                    (local, parent)
+                    (local, share_base, parent)
                 }
                 _ => {
                     ctx.send_msg(P2pMessage::RenameEntryResponse {
@@ -360,8 +467,20 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                     return;
                 }
             };
-            let new_entry = match resolve(&ctx, &resource_id, &new_path) {
-                Some(Resolved::At { local, .. }) => local,
+            let (new_entry, new_base) = match resolve(&ctx, &resource_id, &new_path) {
+                Some(Resolved::At {
+                    local, share_base, ..
+                }) if !windows_refuses_within(&share_base, &local) => (local, share_base),
+                Some(Resolved::At { .. }) => {
+                    ctx.send_msg(P2pMessage::RenameEntryResponse {
+                        request_id,
+                        resource_id,
+                        parent_path,
+                        result: Err("Invalid file name".to_string()),
+                    })
+                    .await;
+                    return;
+                }
                 _ => {
                     ctx.send_msg(P2pMessage::RenameEntryResponse {
                         request_id,
@@ -373,6 +492,20 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                     return;
                 }
             };
+            let stored = stored_as(&new_base, &new_entry).filter(|stored| {
+                *stored != new_entry
+                    && Some(stored) != stored_as(&target_base, &target_entry).as_ref()
+            });
+            if let Some(stored) = stored {
+                ctx.send_msg(P2pMessage::RenameEntryResponse {
+                    request_id,
+                    resource_id,
+                    parent_path,
+                    result: Err(already_there(&new_base, &new_entry, &stored)),
+                })
+                .await;
+                return;
+            }
             let result = fs_local::rename_local_entry(&target_entry, &new_entry).await;
             ctx.send_msg(P2pMessage::RenameEntryResponse {
                 request_id,
@@ -466,7 +599,12 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                     return;
                 }
             };
-            if file_name.contains("..") || file_name.contains('/') || file_name.contains('\\') {
+            if file_name.contains("..")
+                || file_name.contains('/')
+                || file_name.contains('\\')
+                || !is_plain_name(&file_name)
+                || windows_refuses_within(&share_base, &final_dir)
+            {
                 ctx.send_msg(P2pMessage::FileTransferResponse {
                     transfer_id,
                     status: nodeinnet_p2p::FileTransferStatus::Rejected {
@@ -482,6 +620,16 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                     transfer_id,
                     status: nodeinnet_p2p::FileTransferStatus::Rejected {
                         reason: "Cannot upload here (outside the share)".to_string(),
+                    },
+                })
+                .await;
+                return;
+            }
+            if let Some(stored) = stored_as(&share_base, &final_path).filter(|s| *s != final_path) {
+                ctx.send_msg(P2pMessage::FileTransferResponse {
+                    transfer_id,
+                    status: nodeinnet_p2p::FileTransferStatus::Rejected {
+                        reason: already_there(&share_base, &final_path, &stored),
                     },
                 })
                 .await;
@@ -674,7 +822,13 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                         }
                     });
                 } else if ctx.requested_downloads.lock().await.remove(&transfer_id) {
-                    let temp_path = std::env::temp_dir().join(transfer_id.to_string());
+                    let done = download_path(transfer_id);
+                    let temp_path = if total_size == 0 {
+                        let _ = fs_local::create_local_file(&done).await;
+                        done
+                    } else {
+                        done.with_extension("part")
+                    };
                     ctx.active_downloads
                         .lock()
                         .await
@@ -711,7 +865,17 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                     Some(file) => {
                         fs_local::write_file_chunk(&mut *file.lock().await, offset, &data).await
                     }
-                    None => fs_local::write_local_file_chunk(&target_path, offset, &data).await,
+                    None => {
+                        write_download_chunk(
+                            &ctx,
+                            transfer_id,
+                            &target_path,
+                            total_size,
+                            offset,
+                            &data,
+                        )
+                        .await
+                    }
                 };
                 if written.is_ok() {
                     let _ = ctx
@@ -734,7 +898,7 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
             transfer_id,
             checksum: _,
         } => {
-            let (file_name, _permissions) = {
+            let (file_name, _permissions, cut_short) = {
                 let mut map = ctx.active_downloads.lock().await;
                 if let Some((path, _, permissions, file)) = map.remove(&transfer_id) {
                     #[cfg(unix)]
@@ -746,20 +910,30 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                             .set_permissions(std::fs::Permissions::from_mode(mode & PEER_MODE_MASK))
                             .await;
                     }
-                    #[cfg(not(unix))]
-                    let _ = file;
+                    let cut_short = file.is_none() && path != download_path(transfer_id);
+                    if cut_short {
+                        let _ = fs_local::delete_local_entry(&path).await;
+                    }
                     (
                         path.file_name()
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string(),
                         permissions,
+                        cut_short,
                     )
                 } else {
-                    ("unknown".to_string(), None)
+                    ("unknown".to_string(), None, false)
                 }
             };
-            ctx.log(format!("✅ Transfer {} complete", transfer_id));
+            if cut_short {
+                ctx.log(format!(
+                    "❌ Transfer {} ended before all its bytes arrived",
+                    transfer_id
+                ));
+            } else {
+                ctx.log(format!("✅ Transfer {} complete", transfer_id));
+            }
             let _ = ctx
                 .local_event_tx
                 .send(p2p_node::LocalP2pEvent::TransferComplete {
@@ -859,24 +1033,24 @@ mod tests {
         assert_eq!(resolve_in(&many, "/A/../../etc"), None);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     struct Scratch(PathBuf);
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl Scratch {
         fn new() -> Self {
             Self(std::env::temp_dir().join(format!("p2p-handlers-{}", uuid::Uuid::new_v4())))
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn sharing(
         share: &Path,
     ) -> (
@@ -1014,7 +1188,7 @@ mod tests {
         assert!(share.join("out").symlink_metadata().is_ok());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn messages(
         out_rx: &mut tokio::sync::mpsc::Receiver<nodeinnet_p2p::OutboundP2pPayload>,
     ) -> Vec<P2pMessage> {
@@ -1222,6 +1396,286 @@ mod tests {
         assert_eq!(mode_of(&root.0.join("tool")), 0o755);
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_peer_name_with_a_drive_is_refused() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(&root.0).unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+
+        for name in ["C:x", "C:"] {
+            for msg in [
+                P2pMessage::CreateDirectoryRequest {
+                    request_id: uuid::Uuid::new_v4(),
+                    resource_id: "fs-test".to_string(),
+                    parent_path: "/".to_string(),
+                    dir_name: name.to_string(),
+                    permissions: None,
+                },
+                P2pMessage::FileUploadRequest {
+                    resource_id: "fs-test".to_string(),
+                    target_path: "/".to_string(),
+                    file_name: name.to_string(),
+                    total_size: 1,
+                    transfer_id: uuid::Uuid::new_v4(),
+                    permissions: None,
+                },
+            ] {
+                handle_local_fs_message(msg, ctx.clone()).await;
+            }
+            let answers: Vec<_> = std::iter::from_fn(|| out_rx.try_recv().ok())
+                .filter_map(|payload| match payload {
+                    nodeinnet_p2p::OutboundP2pPayload::Message(envelope) => Some(envelope.message),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                matches!(
+                    answers[..],
+                    [
+                        P2pMessage::CreateDirectoryResponse { result: Err(_), .. },
+                        P2pMessage::FileTransferResponse {
+                            status: nodeinnet_p2p::FileTransferStatus::Rejected { .. },
+                            ..
+                        },
+                    ]
+                ),
+                "{name} was taken: {answers:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_peer_name_windows_would_rewrite_is_refused() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(root.0.join("docs")).unwrap();
+        std::fs::write(root.0.join("notes"), b"keep").unwrap();
+        std::fs::write(root.0.join("12"), b"keep").unwrap();
+        std::fs::write(root.0.join("docs").join("a.txt"), b"a").unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+
+        for name in [
+            "12:30.log",
+            "notes.",
+            "notes ",
+            "nul",
+            "NUL .txt",
+            "com1",
+            "a?b",
+        ] {
+            for msg in [
+                P2pMessage::CreateDirectoryRequest {
+                    request_id: uuid::Uuid::new_v4(),
+                    resource_id: "fs-test".to_string(),
+                    parent_path: "/".to_string(),
+                    dir_name: name.to_string(),
+                    permissions: None,
+                },
+                P2pMessage::FileUploadRequest {
+                    resource_id: "fs-test".to_string(),
+                    target_path: "/".to_string(),
+                    file_name: name.to_string(),
+                    total_size: 1,
+                    transfer_id: uuid::Uuid::new_v4(),
+                    permissions: None,
+                },
+                P2pMessage::FileUploadRequest {
+                    resource_id: "fs-test".to_string(),
+                    target_path: format!("/{name}"),
+                    file_name: "x.txt".to_string(),
+                    total_size: 1,
+                    transfer_id: uuid::Uuid::new_v4(),
+                    permissions: None,
+                },
+                P2pMessage::RenameEntryRequest {
+                    request_id: uuid::Uuid::new_v4(),
+                    resource_id: "fs-test".to_string(),
+                    path: "/docs/a.txt".to_string(),
+                    new_path: format!("/{name}"),
+                },
+                P2pMessage::RenameEntryRequest {
+                    request_id: uuid::Uuid::new_v4(),
+                    resource_id: "fs-test".to_string(),
+                    path: "/docs/a.txt".to_string(),
+                    new_path: format!("/{name}/a.txt"),
+                },
+            ] {
+                handle_local_fs_message(msg, ctx.clone()).await;
+            }
+            let answers = messages(&mut out_rx);
+            assert!(
+                matches!(
+                    answers[..],
+                    [
+                        P2pMessage::CreateDirectoryResponse { result: Err(_), .. },
+                        P2pMessage::FileTransferResponse {
+                            status: nodeinnet_p2p::FileTransferStatus::Rejected { .. },
+                            ..
+                        },
+                        P2pMessage::FileTransferResponse {
+                            status: nodeinnet_p2p::FileTransferStatus::Rejected { .. },
+                            ..
+                        },
+                        P2pMessage::RenameEntryResponse { result: Err(_), .. },
+                        P2pMessage::RenameEntryResponse { result: Err(_), .. },
+                    ]
+                ),
+                "{name} was taken: {answers:?}"
+            );
+        }
+        assert_eq!(std::fs::read(root.0.join("notes")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(root.0.join("12")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(root.0.join("docs/a.txt")).unwrap(), b"a");
+    }
+
+    #[cfg(any(windows, target_os = "macos", target_os = "android"))]
+    #[tokio::test]
+    async fn a_name_this_host_takes_for_an_existing_one_is_refused() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(root.0.join("docs")).unwrap();
+        std::fs::write(root.0.join("notes.txt"), b"keep").unwrap();
+        std::fs::write(root.0.join("docs").join("a.txt"), b"keep").unwrap();
+        std::fs::write(root.0.join("b.txt"), b"b").unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+
+        for msg in [
+            P2pMessage::FileUploadRequest {
+                resource_id: "fs-test".to_string(),
+                target_path: "/".to_string(),
+                file_name: "Notes.txt".to_string(),
+                total_size: 1,
+                transfer_id: uuid::Uuid::new_v4(),
+                permissions: None,
+            },
+            P2pMessage::FileUploadRequest {
+                resource_id: "fs-test".to_string(),
+                target_path: "/Docs".to_string(),
+                file_name: "a.txt".to_string(),
+                total_size: 1,
+                transfer_id: uuid::Uuid::new_v4(),
+                permissions: None,
+            },
+            P2pMessage::CreateDirectoryRequest {
+                request_id: uuid::Uuid::new_v4(),
+                resource_id: "fs-test".to_string(),
+                parent_path: "/".to_string(),
+                dir_name: "DOCS".to_string(),
+                permissions: None,
+            },
+            P2pMessage::RenameEntryRequest {
+                request_id: uuid::Uuid::new_v4(),
+                resource_id: "fs-test".to_string(),
+                path: "/b.txt".to_string(),
+                new_path: "/NOTES.txt".to_string(),
+            },
+            P2pMessage::RenameEntryRequest {
+                request_id: uuid::Uuid::new_v4(),
+                resource_id: "fs-test".to_string(),
+                path: "/b.txt".to_string(),
+                new_path: "/Docs/A.txt".to_string(),
+            },
+        ] {
+            handle_local_fs_message(msg, ctx.clone()).await;
+        }
+
+        let answers = messages(&mut out_rx);
+        let refused = |answer: &P2pMessage| match answer {
+            P2pMessage::FileTransferResponse {
+                status: nodeinnet_p2p::FileTransferStatus::Rejected { reason },
+                ..
+            } => Some(reason.clone()),
+            P2pMessage::CreateDirectoryResponse {
+                result: Err(reason),
+                ..
+            }
+            | P2pMessage::RenameEntryResponse {
+                result: Err(reason),
+                ..
+            } => Some(reason.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            answers.iter().map(refused).collect::<Vec<_>>(),
+            [
+                Some("\"Notes.txt\" already exists here as \"notes.txt\"".to_string()),
+                Some("\"Docs/a.txt\" already exists here as \"docs/a.txt\"".to_string()),
+                Some("\"DOCS\" already exists here as \"docs\"".to_string()),
+                Some("\"NOTES.txt\" already exists here as \"notes.txt\"".to_string()),
+                Some("\"Docs/A.txt\" already exists here as \"docs/a.txt\"".to_string()),
+            ],
+            "{answers:?}"
+        );
+        assert_eq!(std::fs::read(root.0.join("notes.txt")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(root.0.join("docs/a.txt")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(root.0.join("b.txt")).unwrap(), b"b");
+    }
+
+    #[cfg(any(windows, target_os = "macos", target_os = "android"))]
+    #[tokio::test]
+    async fn an_exact_name_a_new_name_and_a_change_of_case_go_through() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(root.0.join("docs")).unwrap();
+        std::fs::write(root.0.join("notes.txt"), b"keep").unwrap();
+        std::fs::write(root.0.join("x.txt"), b"x").unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+
+        for msg in [
+            P2pMessage::RenameEntryRequest {
+                request_id: uuid::Uuid::new_v4(),
+                resource_id: "fs-test".to_string(),
+                path: "/notes.txt".to_string(),
+                new_path: "/Notes.txt".to_string(),
+            },
+            P2pMessage::FileUploadRequest {
+                resource_id: "fs-test".to_string(),
+                target_path: "/".to_string(),
+                file_name: "x.txt".to_string(),
+                total_size: 1,
+                transfer_id: uuid::Uuid::new_v4(),
+                permissions: None,
+            },
+            P2pMessage::FileUploadRequest {
+                resource_id: "fs-test".to_string(),
+                target_path: "/Docs".to_string(),
+                file_name: "new.txt".to_string(),
+                total_size: 1,
+                transfer_id: uuid::Uuid::new_v4(),
+                permissions: None,
+            },
+            P2pMessage::CreateDirectoryRequest {
+                request_id: uuid::Uuid::new_v4(),
+                resource_id: "fs-test".to_string(),
+                parent_path: "/docs".to_string(),
+                dir_name: "fresh".to_string(),
+                permissions: None,
+            },
+        ] {
+            handle_local_fs_message(msg, ctx.clone()).await;
+        }
+
+        let answers = messages(&mut out_rx);
+        assert!(
+            matches!(
+                answers[..],
+                [
+                    P2pMessage::RenameEntryResponse { result: Ok(()), .. },
+                    P2pMessage::FileTransferResponse {
+                        status: nodeinnet_p2p::FileTransferStatus::Accepted { .. },
+                        ..
+                    },
+                    P2pMessage::FileTransferResponse {
+                        status: nodeinnet_p2p::FileTransferStatus::Accepted { .. },
+                        ..
+                    },
+                    P2pMessage::CreateDirectoryResponse { result: Ok(()), .. },
+                ]
+            ),
+            "{answers:?}"
+        );
+        assert_eq!(std::fs::read(root.0.join("Notes.txt")).unwrap(), b"keep");
+    }
+
     #[cfg(unix)]
     struct Downloaded(PathBuf);
 
@@ -1236,6 +1690,7 @@ mod tests {
     impl Drop for Downloaded {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(self.0.with_extension("part"));
         }
     }
 
@@ -1323,6 +1778,141 @@ mod tests {
         .await;
 
         assert_eq!(std::fs::read(&file.0).unwrap(), b"hi bob");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_empty_download_leaves_an_empty_file() {
+        let root = Scratch::new();
+        let (ctx, _out_rx) = sharing(&root.0);
+        let transfer_id = uuid::Uuid::new_v4();
+        let file = Downloaded::of(transfer_id);
+        ctx.requested_downloads.lock().await.insert(transfer_id);
+
+        deliver_download(&ctx, transfer_id, 0, &[]).await;
+
+        assert_eq!(std::fs::read(&file.0).unwrap(), b"");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_download_that_got_none_of_its_bytes_leaves_no_file() {
+        let root = Scratch::new();
+        let (ctx, _out_rx) = sharing(&root.0);
+        let transfer_id = uuid::Uuid::new_v4();
+        let file = Downloaded::of(transfer_id);
+        ctx.requested_downloads.lock().await.insert(transfer_id);
+
+        deliver_download(&ctx, transfer_id, 6, &[]).await;
+
+        assert!(
+            !file.0.exists(),
+            "a download that got none of its bytes passed for an empty file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_download_cut_short_leaves_no_file() {
+        let root = Scratch::new();
+        let (ctx, _out_rx) = sharing(&root.0);
+        let transfer_id = uuid::Uuid::new_v4();
+        let file = Downloaded::of(transfer_id);
+        ctx.requested_downloads.lock().await.insert(transfer_id);
+
+        for msg in [
+            P2pMessage::FileTransferResponse {
+                transfer_id,
+                status: nodeinnet_p2p::FileTransferStatus::Accepted { total_size: 6 },
+            },
+            P2pMessage::FileChunk {
+                transfer_id,
+                offset: 0,
+                data: b"hi ".to_vec(),
+            },
+        ] {
+            handle_local_fs_message(msg, ctx.clone()).await;
+        }
+        assert!(
+            !file.0.exists(),
+            "a reader woken by FileTransferComplete would take 3 of the 6 bytes"
+        );
+        handle_local_fs_message(
+            P2pMessage::FileTransferComplete {
+                transfer_id,
+                checksum: None,
+            },
+            ctx.clone(),
+        )
+        .await;
+
+        assert!(!file.0.exists());
+        assert!(!file.0.with_extension("part").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_chunks_do_not_make_up_for_missing_bytes() {
+        let root = Scratch::new();
+        let (ctx, _out_rx) = sharing(&root.0);
+        let short = uuid::Uuid::new_v4();
+        let whole = uuid::Uuid::new_v4();
+        let files = [short, whole].map(Downloaded::of);
+        ctx.requested_downloads.lock().await.extend([short, whole]);
+
+        deliver_download(
+            &ctx,
+            short,
+            6,
+            &[(0, b"hi "), (0, b"hi "), (1, b"i b"), (5, b"b")],
+        )
+        .await;
+        deliver_download(&ctx, whole, 6, &[(0, b"hi "), (1, b"i "), (2, b" bob")]).await;
+
+        assert!(!files[0].0.exists());
+        assert!(!files[0].0.with_extension("part").exists());
+        assert_eq!(std::fs::read(&files[1].0).unwrap(), b"hi bob");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serving_an_empty_file_accepts_zero_bytes_and_completes() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(&root.0).unwrap();
+        std::fs::write(root.0.join("empty"), b"").unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+
+        handle_local_fs_message(
+            P2pMessage::FileDownloadRequest {
+                resource_id: "fs-test".to_string(),
+                file_path: "/empty".to_string(),
+                transfer_id: uuid::Uuid::new_v4(),
+                offset: 0,
+                length: None,
+            },
+            ctx,
+        )
+        .await;
+
+        let mut accepted = None;
+        loop {
+            let payload = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
+                .await
+                .expect("the download went quiet")
+                .expect("the download ended without FileTransferComplete");
+            let nodeinnet_p2p::OutboundP2pPayload::Message(envelope) = payload else {
+                continue;
+            };
+            match envelope.message {
+                P2pMessage::FileTransferResponse {
+                    status: nodeinnet_p2p::FileTransferStatus::Accepted { total_size },
+                    ..
+                } => accepted = Some(total_size),
+                P2pMessage::FileTransferComplete { .. } => break,
+                other => panic!("unexpected answer to the download: {other:?}"),
+            }
+        }
+        assert_eq!(accepted, Some(0));
     }
 
     #[cfg(unix)]
