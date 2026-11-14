@@ -36,6 +36,9 @@ screencapturekit = { version = "1.5.4", optional = true }
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
 screenshots = { version = "0.8", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1.36", features = ["full"] }
@@ -43,7 +46,7 @@ tokio = { version = "1.36", features = ["full"] }
 [features]
 default = ["all", "screen-capture"]
 all = ["fs", "terminal", "sysinfo", "net", "sync", "registry", "desktop"]
-fs = []
+fs = ["dep:libc"]
 terminal = ["dep:portable-pty"]
 sysinfo = ["dep:sysinfo", "dep:network-interface"]
 net = ["dep:reqwest", "dep:network-interface"]

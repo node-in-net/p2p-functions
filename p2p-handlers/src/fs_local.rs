@@ -116,14 +116,21 @@ fn windows_refuses_within(share_base: &Path, local: &Path) -> bool {
         })
 }
 
-fn stored_as(share_base: &Path, local: &Path) -> Option<PathBuf> {
-    let by = if cfg!(windows) {
+fn host_comparison() -> Comparison {
+    if cfg!(windows) {
         Comparison::Windows
     } else if cfg!(any(target_os = "macos", target_os = "android")) {
         Comparison::MacOs
     } else {
+        Comparison::Exact
+    }
+}
+
+fn stored_as(share_base: &Path, local: &Path) -> Option<PathBuf> {
+    let by = host_comparison();
+    if by == Comparison::Exact {
         return None;
-    };
+    }
     let mut stored = share_base.to_path_buf();
     for part in local.strip_prefix(share_base).ok()?.components() {
         let wanted = part.as_os_str();
@@ -145,6 +152,49 @@ fn stored_as(share_base: &Path, local: &Path) -> Option<PathBuf> {
         stored.push(name);
     }
     Some(stored)
+}
+
+type Reserved = Vec<(u64, PathBuf)>;
+
+static RESERVED: std::sync::Mutex<Reserved> = std::sync::Mutex::new(Vec::new());
+
+struct Reservation(u64);
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        reserved().retain(|(id, _)| *id != self.0);
+    }
+}
+
+fn reserved() -> std::sync::MutexGuard<'static, Reserved> {
+    RESERVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn folded_parts(path: &Path, by: Comparison) -> Vec<String> {
+    path.components()
+        .map(|part| folded(&part.as_os_str().to_string_lossy(), by).into_owned())
+        .collect()
+}
+
+fn taken_by<'a>(reserved: &'a Reserved, path: &Path, by: Comparison) -> Option<&'a PathBuf> {
+    let wanted = folded_parts(path, by);
+    reserved
+        .iter()
+        .map(|(_, held)| held)
+        .find(|held| held.file_name() != path.file_name() && folded_parts(held, by) == wanted)
+}
+
+fn reserve(path: &Path, by: Comparison) -> Result<Reservation, PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut reserved = reserved();
+    if let Some(held) = taken_by(&reserved, path, by) {
+        return Err(held.clone());
+    }
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    reserved.push((id, path.to_path_buf()));
+    Ok(Reservation(id))
 }
 
 fn already_there(share_base: &Path, wanted: &Path, stored: &Path) -> String {
@@ -187,9 +237,118 @@ async fn write_download_chunk(
     }
     fs_local::rename_local_entry(path, &done).await?;
     if let Some(download) = ctx.active_downloads.lock().await.get_mut(&transfer_id) {
-        download.0 = done;
+        download.path = done;
     }
     Ok(())
+}
+
+async fn write_upload_chunk(
+    ctx: &NodeContext,
+    transfer_id: uuid::Uuid,
+    upload: &p2p_node::ActiveUpload,
+    total_size: u64,
+    offset: u64,
+    data: &[u8],
+) -> Result<u64, String> {
+    let end = offset
+        .checked_add(data.len() as u64)
+        .filter(|end| *end <= total_size)
+        .ok_or_else(|| format!("more than the {total_size} bytes announced"))?;
+    if offset > upload.stored {
+        return Err(format!("bytes {}..{offset} never arrived", upload.stored));
+    }
+    fs_local::write_file_chunk(&mut *upload.file.lock().await, offset, data).await?;
+    if let Some(p2p_node::ActiveDownload {
+        upload: Some(upload),
+        ..
+    }) = ctx.active_downloads.lock().await.get_mut(&transfer_id)
+    {
+        upload.stored = upload.stored.max(end);
+    }
+    Ok(end)
+}
+
+async fn discard_upload(upload: p2p_node::ActiveUpload) {
+    let temp = upload.temp.clone();
+    drop(upload);
+    let _ = tokio::fs::remove_file(temp).await;
+}
+
+async fn store_upload(path: &Path, upload: p2p_node::ActiveUpload) -> Result<(), String> {
+    let path = fs_local::sanitize_windows_path(path);
+    let p2p_node::ActiveUpload {
+        file,
+        temp,
+        permissions,
+        reservation,
+        ..
+    } = upload;
+    let synced = {
+        let file = file.lock().await;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let replaced = tokio::fs::symlink_metadata(&path)
+                .await
+                .ok()
+                .filter(|meta| meta.is_file())
+                .map(|meta| meta.permissions().mode());
+            if let Some(mode) = permissions.or(replaced) {
+                let _ = file
+                    .set_permissions(std::fs::Permissions::from_mode(mode & PEER_MODE_MASK))
+                    .await;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = permissions;
+        file.sync_all().await.map_err(|e| e.to_string())
+    };
+    drop(file);
+    if let Err(e) = synced {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(e);
+    }
+    if let Err(e) = tokio::fs::rename(&temp, &path).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(e.to_string());
+    }
+    drop(reservation);
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Ok(dir) = tokio::fs::File::open(dir).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+    Ok(())
+}
+
+async fn answer_upload(
+    ctx: &NodeContext,
+    transfer_id: uuid::Uuid,
+    path: &Path,
+    result: Result<(), String>,
+) {
+    match &result {
+        Ok(()) => ctx.log(format!("✅ Upload {} stored", transfer_id)),
+        Err(e) => ctx.log(format!("❌ Upload {} failed: {}", transfer_id, e)),
+    }
+    ctx.send_msg(P2pMessage::FileTransferReceipt {
+        transfer_id,
+        result,
+    })
+    .await;
+    let _ = ctx
+        .local_event_tx
+        .send(p2p_node::LocalP2pEvent::TransferComplete {
+            transfer_id,
+            file_name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            is_upload: false,
+        })
+        .await;
 }
 
 pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
@@ -492,6 +651,19 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                     return;
                 }
             };
+            let _reservation = match reserve(&new_entry, host_comparison()) {
+                Ok(reservation) => reservation,
+                Err(held) => {
+                    ctx.send_msg(P2pMessage::RenameEntryResponse {
+                        request_id,
+                        resource_id,
+                        parent_path,
+                        result: Err(already_there(&new_base, &new_entry, &held)),
+                    })
+                    .await;
+                    return;
+                }
+            };
             let stored = stored_as(&new_base, &new_entry).filter(|stored| {
                 *stored != new_entry
                     && Some(stored) != stored_as(&target_base, &target_entry).as_ref()
@@ -625,6 +797,19 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                 .await;
                 return;
             }
+            let reservation = match reserve(&final_path, host_comparison()) {
+                Ok(reservation) => reservation,
+                Err(held) => {
+                    ctx.send_msg(P2pMessage::FileTransferResponse {
+                        transfer_id,
+                        status: nodeinnet_p2p::FileTransferStatus::Rejected {
+                            reason: already_there(&share_base, &final_path, &held),
+                        },
+                    })
+                    .await;
+                    return;
+                }
+            };
             if let Some(stored) = stored_as(&share_base, &final_path).filter(|s| *s != final_path) {
                 ctx.send_msg(P2pMessage::FileTransferResponse {
                     transfer_id,
@@ -636,8 +821,22 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                 return;
             }
             let _ = fs_local::create_local_directory(&final_dir).await;
+            if tokio::fs::symlink_metadata(fs_local::sanitize_windows_path(&final_path))
+                .await
+                .is_ok_and(|meta| meta.is_dir())
+            {
+                ctx.send_msg(P2pMessage::FileTransferResponse {
+                    transfer_id,
+                    status: nodeinnet_p2p::FileTransferStatus::Rejected {
+                        reason: "Cannot upload over a folder".to_string(),
+                    },
+                })
+                .await;
+                return;
+            }
 
-            match fs_local::create_local_file_within(&share_base, &final_path).await {
+            let temp = final_dir.join(format!(".~{transfer_id}.part"));
+            match fs_local::create_new_file_within(&share_base, &temp).await {
                 Err(e) => {
                     ctx.log(format!("❌ Failed to create file for upload: {}", e));
                     ctx.send_msg(P2pMessage::FileTransferResponse {
@@ -647,10 +846,19 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                     .await;
                 }
                 Ok(file) => {
-                    let file = std::sync::Arc::new(tokio::sync::Mutex::new(file));
                     ctx.active_downloads.lock().await.insert(
                         transfer_id,
-                        (final_path, total_size, permissions, Some(file)),
+                        p2p_node::ActiveDownload {
+                            path: final_path,
+                            total_size,
+                            upload: Some(p2p_node::ActiveUpload {
+                                file: std::sync::Arc::new(tokio::sync::Mutex::new(file)),
+                                temp: fs_local::sanitize_windows_path(&temp),
+                                permissions,
+                                stored: 0,
+                                reservation: std::sync::Arc::new(reservation),
+                            }),
+                        },
                     );
                     ctx.send_msg(P2pMessage::FileTransferResponse {
                         transfer_id,
@@ -757,71 +965,7 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
             status,
         } => match status {
             nodeinnet_p2p::FileTransferStatus::Accepted { total_size } => {
-                let is_upload = { ctx.active_uploads.lock().await.remove(&transfer_id) };
-                if let Some(local_path) = is_upload {
-                    ctx.log(format!(
-                        "⬆️ Upload accepted! Starting transfer {}...",
-                        transfer_id
-                    ));
-                    let ctx_clone = ctx.clone();
-                    tokio::spawn(async move {
-                        let (tx, mut rx) = tokio_mpsc::channel(
-                            client_core::limits::outbound_queue_slots(16 * 1024),
-                        );
-                        if fs_local::start_local_download(local_path.clone(), tx, 0, None)
-                            .await
-                            .is_ok()
-                        {
-                            let mut offset = 0u64;
-                            let file_name = local_path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string();
-                            while let Some(res) = rx.recv().await {
-                                match res {
-                                    Ok(data) => {
-                                        if data.is_empty() {
-                                            break;
-                                        }
-                                        ctx_clone
-                                            .send_msg(P2pMessage::FileChunk {
-                                                transfer_id,
-                                                offset,
-                                                data: data.clone(),
-                                            })
-                                            .await;
-                                        offset += data.len() as u64;
-                                        let _ = ctx_clone
-                                            .local_event_tx
-                                            .send(p2p_node::LocalP2pEvent::TransferProgress {
-                                                transfer_id,
-                                                file_name: file_name.clone(),
-                                                bytes_read: offset,
-                                                total_bytes: total_size,
-                                            })
-                                            .await;
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                            ctx_clone
-                                .send_msg(P2pMessage::FileTransferComplete {
-                                    transfer_id,
-                                    checksum: None,
-                                })
-                                .await;
-                            let _ = ctx_clone
-                                .local_event_tx
-                                .send(p2p_node::LocalP2pEvent::TransferComplete {
-                                    transfer_id,
-                                    file_name,
-                                    is_upload: true,
-                                })
-                                .await;
-                        }
-                    });
-                } else if ctx.requested_downloads.lock().await.remove(&transfer_id) {
+                if ctx.requested_downloads.lock().await.remove(&transfer_id) {
                     let done = download_path(transfer_id);
                     let temp_path = if total_size == 0 {
                         let _ = fs_local::create_local_file(&done).await;
@@ -829,10 +973,14 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                     } else {
                         done.with_extension("part")
                     };
-                    ctx.active_downloads
-                        .lock()
-                        .await
-                        .insert(transfer_id, (temp_path, total_size, None, None));
+                    ctx.active_downloads.lock().await.insert(
+                        transfer_id,
+                        p2p_node::ActiveDownload {
+                            path: temp_path,
+                            total_size,
+                            upload: None,
+                        },
+                    );
                 } else {
                     ctx.log(format!(
                         "⏭️ No download registered for accepted transfer {}",
@@ -854,79 +1002,111 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
             data,
         } => {
             let stream_info = { ctx.active_downloads.lock().await.get(&transfer_id).cloned() };
-            if let Some((target_path, total_size, _, file)) = stream_info {
-                let Some(current_total) = offset
-                    .checked_add(data.len() as u64)
-                    .filter(|end| *end <= total_size)
-                else {
-                    return;
-                };
-                let written = match file {
-                    Some(file) => {
-                        fs_local::write_file_chunk(&mut *file.lock().await, offset, &data).await
-                    }
-                    None => {
-                        write_download_chunk(
-                            &ctx,
-                            transfer_id,
-                            &target_path,
-                            total_size,
-                            offset,
-                            &data,
-                        )
+            let Some(p2p_node::ActiveDownload {
+                path: target_path,
+                total_size,
+                upload,
+            }) = stream_info
+            else {
+                return;
+            };
+            let current_total = match upload {
+                Some(upload) => {
+                    match write_upload_chunk(&ctx, transfer_id, &upload, total_size, offset, &data)
                         .await
+                    {
+                        Ok(end) => end,
+                        Err(reason) => {
+                            drop(upload);
+                            let removed = ctx.active_downloads.lock().await.remove(&transfer_id);
+                            if let Some(p2p_node::ActiveDownload {
+                                upload: Some(upload),
+                                ..
+                            }) = removed
+                            {
+                                discard_upload(upload).await;
+                                ctx.log(format!("❌ Upload {} failed: {}", transfer_id, reason));
+                                ctx.send_msg(P2pMessage::FileTransferReceipt {
+                                    transfer_id,
+                                    result: Err(reason),
+                                })
+                                .await;
+                            }
+                            return;
+                        }
                     }
-                };
-                if written.is_ok() {
-                    let _ = ctx
-                        .local_event_tx
-                        .send(p2p_node::LocalP2pEvent::TransferProgress {
-                            transfer_id,
-                            file_name: target_path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string(),
-                            bytes_read: current_total,
-                            total_bytes: total_size,
-                        })
-                        .await;
                 }
-            }
+                None => {
+                    let Some(end) = offset
+                        .checked_add(data.len() as u64)
+                        .filter(|end| *end <= total_size)
+                    else {
+                        return;
+                    };
+                    if write_download_chunk(
+                        &ctx,
+                        transfer_id,
+                        &target_path,
+                        total_size,
+                        offset,
+                        &data,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    end
+                }
+            };
+            let _ = ctx
+                .local_event_tx
+                .send(p2p_node::LocalP2pEvent::TransferProgress {
+                    transfer_id,
+                    file_name: target_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    bytes_read: current_total,
+                    total_bytes: total_size,
+                })
+                .await;
         }
         P2pMessage::FileTransferComplete {
             transfer_id,
             checksum: _,
         } => {
-            let (file_name, _permissions, cut_short) = {
-                let mut map = ctx.active_downloads.lock().await;
-                if let Some((path, _, permissions, file)) = map.remove(&transfer_id) {
-                    #[cfg(unix)]
-                    if let (Some(mode), Some(file)) = (permissions, &file) {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = file
-                            .lock()
-                            .await
-                            .set_permissions(std::fs::Permissions::from_mode(mode & PEER_MODE_MASK))
-                            .await;
+            let finished = ctx.active_downloads.lock().await.remove(&transfer_id);
+            let path = match finished {
+                Some(p2p_node::ActiveDownload {
+                    path,
+                    total_size,
+                    upload: Some(upload),
+                }) => {
+                    if upload.stored < total_size {
+                        let stored = upload.stored;
+                        discard_upload(upload).await;
+                        let ended = Err(format!("ended after {stored} of {total_size} bytes"));
+                        answer_upload(&ctx, transfer_id, &path, ended).await;
+                    } else {
+                        let ctx = ctx.clone();
+                        tokio::spawn(async move {
+                            let stored = store_upload(&path, upload).await;
+                            answer_upload(&ctx, transfer_id, &path, stored).await;
+                        });
                     }
-                    let cut_short = file.is_none() && path != download_path(transfer_id);
-                    if cut_short {
-                        let _ = fs_local::delete_local_entry(&path).await;
-                    }
-                    (
-                        path.file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string(),
-                        permissions,
-                        cut_short,
-                    )
-                } else {
-                    ("unknown".to_string(), None, false)
+                    return;
+                }
+                Some(download) => download.path,
+                None => {
+                    let unknown = Err(format!("no upload {transfer_id} is open here"));
+                    answer_upload(&ctx, transfer_id, Path::new("unknown"), unknown).await;
+                    return;
                 }
             };
-            if cut_short {
+            if path != download_path(transfer_id) {
+                let _ = fs_local::delete_local_entry(&path).await;
                 ctx.log(format!(
                     "❌ Transfer {} ended before all its bytes arrived",
                     transfer_id
@@ -938,7 +1118,11 @@ pub async fn handle_local_fs_message(p2p_msg: P2pMessage, ctx: NodeContext) {
                 .local_event_tx
                 .send(p2p_node::LocalP2pEvent::TransferComplete {
                     transfer_id,
-                    file_name,
+                    file_name: path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
                     is_upload: false,
                 })
                 .await;
@@ -1200,6 +1384,70 @@ mod tests {
             .collect()
     }
 
+    #[cfg(any(unix, windows))]
+    async fn next_answer(
+        out_rx: &mut tokio::sync::mpsc::Receiver<nodeinnet_p2p::OutboundP2pPayload>,
+    ) -> P2pMessage {
+        loop {
+            let payload = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
+                .await
+                .expect("nothing was answered within 5 s")
+                .expect("the session closed");
+            if let nodeinnet_p2p::OutboundP2pPayload::Message(envelope) = payload {
+                return envelope.message;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn receipt(
+        out_rx: &mut tokio::sync::mpsc::Receiver<nodeinnet_p2p::OutboundP2pPayload>,
+    ) -> Result<(), String> {
+        loop {
+            if let P2pMessage::FileTransferReceipt { result, .. } = next_answer(out_rx).await {
+                return result;
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn upload_of(
+        name: &str,
+        total_size: u64,
+        chunks: &[(u64, &[u8])],
+        permissions: Option<u32>,
+    ) -> (uuid::Uuid, Vec<P2pMessage>) {
+        let transfer_id = uuid::Uuid::new_v4();
+        let mut messages = vec![P2pMessage::FileUploadRequest {
+            resource_id: "fs-test".to_string(),
+            target_path: "/".to_string(),
+            file_name: name.to_string(),
+            total_size,
+            transfer_id,
+            permissions,
+        }];
+        messages.extend(chunks.iter().map(|(offset, data)| P2pMessage::FileChunk {
+            transfer_id,
+            offset: *offset,
+            data: data.to_vec(),
+        }));
+        messages.push(P2pMessage::FileTransferComplete {
+            transfer_id,
+            checksum: None,
+        });
+        (transfer_id, messages)
+    }
+
+    #[cfg(any(unix, windows))]
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_link_renamed_over_an_accepted_upload_gets_none_of_its_bytes() {
@@ -1243,18 +1491,21 @@ mod tests {
             handle_local_fs_message(msg, ctx.clone()).await;
         }
 
-        let answers = messages(&mut out_rx);
         assert!(matches!(
-            answers[0],
+            next_answer(&mut out_rx).await,
             P2pMessage::FileTransferResponse {
                 status: nodeinnet_p2p::FileTransferStatus::Accepted { .. },
                 ..
             }
         ));
         assert!(matches!(
-            answers[1],
+            next_answer(&mut out_rx).await,
             P2pMessage::RenameEntryResponse { result: Ok(()), .. }
         ));
+        assert_eq!(receipt(&mut out_rx).await, Ok(()));
+        let victim = share.join("victim");
+        assert!(std::fs::symlink_metadata(&victim).unwrap().is_file());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"hacked");
         assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
         assert_eq!(
             std::fs::metadata(&outside).unwrap().permissions().mode() & 0o7777,
@@ -1307,6 +1558,72 @@ mod tests {
             }
         }
         assert_eq!(sent, b"victim");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_in_a_share_is_refused_and_the_session_goes_on() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(&root.0).unwrap();
+        let fifo = root.0.join("pipe");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let (ctx, mut out_rx) = sharing(&root.0);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_local_fs_message(
+                P2pMessage::FileDownloadRequest {
+                    resource_id: "fs-test".to_string(),
+                    file_path: "/pipe".to_string(),
+                    transfer_id: uuid::Uuid::new_v4(),
+                    offset: 0,
+                    length: None,
+                },
+                ctx.clone(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            let _ = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fifo);
+            panic!("the download of a FIFO held up the session");
+        });
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("the download went unanswered");
+        assert!(
+            matches!(
+                &answer,
+                Some(nodeinnet_p2p::OutboundP2pPayload::Message(nodeinnet_p2p::SecuredP2pEnvelope {
+                    message: P2pMessage::FileTransferResponse {
+                        status: nodeinnet_p2p::FileTransferStatus::Rejected { reason },
+                        ..
+                    },
+                    ..
+                })) if reason == "Not a regular file"
+            ),
+            "{answer:?}"
+        );
+
+        handle_local_fs_message(
+            P2pMessage::RequestEntries {
+                request_id: uuid::Uuid::new_v4(),
+                resource_id: "fs-test".to_string(),
+                path: "/".to_string(),
+            },
+            ctx,
+        )
+        .await;
+        assert!(matches!(
+            messages(&mut out_rx)[..],
+            [P2pMessage::EntriesResponse { .. }]
+        ));
     }
 
     #[cfg(unix)]
@@ -1367,32 +1684,45 @@ mod tests {
     async fn a_peer_upload_cannot_set_setuid_or_setgid() {
         let root = Scratch::new();
         std::fs::create_dir_all(&root.0).unwrap();
-        let (ctx, _out_rx) = sharing(&root.0);
-        let transfer_id = uuid::Uuid::new_v4();
+        let (ctx, mut out_rx) = sharing(&root.0);
 
-        for msg in [
-            P2pMessage::FileUploadRequest {
-                resource_id: "fs-test".to_string(),
-                target_path: "/".to_string(),
-                file_name: "tool".to_string(),
-                total_size: 10,
-                transfer_id,
-                permissions: Some(0o6755),
-            },
-            P2pMessage::FileChunk {
-                transfer_id,
-                offset: 0,
-                data: b"#!/bin/sh\n".to_vec(),
-            },
-            P2pMessage::FileTransferComplete {
-                transfer_id,
-                checksum: None,
-            },
-        ] {
+        for msg in upload_of("tool", 10, &[(0, b"#!/bin/sh\n")], Some(0o6755)).1 {
             handle_local_fs_message(msg, ctx.clone()).await;
         }
 
+        assert_eq!(receipt(&mut out_rx).await, Ok(()));
         assert_eq!(std::fs::read(root.0.join("tool")).unwrap(), b"#!/bin/sh\n");
+        assert_eq!(mode_of(&root.0.join("tool")), 0o755);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_upload_over_a_file_keeps_its_mode_but_not_setuid() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Scratch::new();
+        std::fs::create_dir_all(&root.0).unwrap();
+        let modes = [
+            ("deploy.sh", 0o755),
+            ("shared.txt", 0o664),
+            ("tool", 0o4755),
+        ];
+        for (name, mode) in modes {
+            let path = root.0.join(name);
+            std::fs::write(&path, b"old").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let (ctx, mut out_rx) = sharing(&root.0);
+
+        for (name, _) in modes {
+            for msg in upload_of(name, 3, &[(0, b"new")], None).1 {
+                handle_local_fs_message(msg, ctx.clone()).await;
+            }
+            assert_eq!(receipt(&mut out_rx).await, Ok(()), "{name}");
+        }
+
+        assert_eq!(std::fs::read(root.0.join("deploy.sh")).unwrap(), b"new");
+        assert_eq!(mode_of(&root.0.join("deploy.sh")), 0o755);
+        assert_eq!(mode_of(&root.0.join("shared.txt")), 0o664);
         assert_eq!(mode_of(&root.0.join("tool")), 0o755);
     }
 
@@ -1676,6 +2006,150 @@ mod tests {
         assert_eq!(std::fs::read(root.0.join("Notes.txt")).unwrap(), b"keep");
     }
 
+    #[cfg(any(windows, target_os = "macos", target_os = "android"))]
+    #[tokio::test]
+    async fn a_name_that_lands_as_an_open_upload_is_refused() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(&root.0).unwrap();
+        std::fs::write(root.0.join("x.txt"), b"x").unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+        let (first, upload) = upload_of("Makefile", 5, &[(0, b"first")], None);
+        let (second, later) = upload_of("makefile", 5, &[(0, b"later")], None);
+
+        for msg in [
+            upload[0].clone(),
+            later[0].clone(),
+            P2pMessage::RenameEntryRequest {
+                request_id: uuid::Uuid::new_v4(),
+                resource_id: "fs-test".to_string(),
+                path: "/x.txt".to_string(),
+                new_path: "/MAKEFILE".to_string(),
+            },
+            upload[1].clone(),
+            later[1].clone(),
+            later[2].clone(),
+            upload[2].clone(),
+        ] {
+            handle_local_fs_message(msg, ctx.clone()).await;
+        }
+
+        assert!(matches!(
+            next_answer(&mut out_rx).await,
+            P2pMessage::FileTransferResponse {
+                status: nodeinnet_p2p::FileTransferStatus::Accepted { .. },
+                ..
+            }
+        ));
+        let refused = next_answer(&mut out_rx).await;
+        assert!(
+            matches!(
+                &refused,
+                P2pMessage::FileTransferResponse {
+                    status: nodeinnet_p2p::FileTransferStatus::Rejected { reason },
+                    ..
+                } if reason == "\"makefile\" already exists here as \"Makefile\""
+            ),
+            "{refused:?}"
+        );
+        let renamed = next_answer(&mut out_rx).await;
+        assert!(
+            matches!(
+                &renamed,
+                P2pMessage::RenameEntryResponse { result: Err(reason), .. }
+                    if reason == "\"MAKEFILE\" already exists here as \"Makefile\""
+            ),
+            "{renamed:?}"
+        );
+        let mut receipts = Vec::new();
+        while receipts.len() < 2 {
+            if let P2pMessage::FileTransferReceipt {
+                transfer_id,
+                result,
+            } = next_answer(&mut out_rx).await
+            {
+                receipts.push((transfer_id, result));
+            }
+        }
+        receipts.sort();
+        let mut expected = vec![
+            (first, Ok(())),
+            (second, Err(format!("no upload {second} is open here"))),
+        ];
+        expected.sort();
+        assert_eq!(receipts, expected);
+        assert_eq!(names_in(&root.0), ["Makefile", "x.txt"]);
+        assert_eq!(std::fs::read(root.0.join("Makefile")).unwrap(), b"first");
+        assert_eq!(std::fs::read(root.0.join("x.txt")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn a_reserved_name_turns_away_only_the_names_that_land_as_it() {
+        let dir = std::env::temp_dir().join(format!("p2p-handlers-{}", uuid::Uuid::new_v4()));
+        let held = reserve(&dir.join("Makefile"), Comparison::Windows).unwrap();
+        assert_eq!(
+            reserve(&dir.join("makefile"), Comparison::Windows).err(),
+            Some(dir.join("Makefile"))
+        );
+        assert_eq!(
+            reserve(&dir.join("MAKEFILE"), Comparison::MacOs).err(),
+            Some(dir.join("Makefile"))
+        );
+        assert!(reserve(&dir.join("makefile"), Comparison::Exact).is_ok());
+        assert!(reserve(&dir.join("sub").join("makefile"), Comparison::Windows).is_ok());
+        let again = reserve(&dir.join("Makefile"), Comparison::Windows).unwrap();
+        drop(held);
+        assert!(reserve(&dir.join("makefile"), Comparison::Windows).is_err());
+        drop(again);
+        assert!(reserve(&dir.join("makefile"), Comparison::Windows).is_ok());
+
+        let _composed = reserve(&dir.join("caf\u{e9}"), Comparison::MacOs).unwrap();
+        assert!(reserve(&dir.join("cafe\u{301}"), Comparison::MacOs).is_err());
+        assert!(reserve(&dir.join("cafe\u{301}"), Comparison::Windows).is_ok());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn an_upload_holds_its_name_until_it_is_stored_or_dropped() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(&root.0).unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+        let held =
+            |name: &str| taken_by(&reserved(), &root.0.join(name), Comparison::Windows).cloned();
+        let (stored, stored_upload) = upload_of("Stored", 2, &[(0, b"ok")], None);
+        let (cut, cut_upload) = upload_of("Cut", 2, &[(0, b"o")], None);
+        let (_, open_upload) = upload_of("Open", 2, &[], None);
+
+        for msg in [&stored_upload[0], &cut_upload[0], &open_upload[0]] {
+            handle_local_fs_message(msg.clone(), ctx.clone()).await;
+        }
+        assert_eq!(held("STORED"), Some(root.0.join("Stored")));
+        assert_eq!(held("CUT"), Some(root.0.join("Cut")));
+        assert_eq!(held("OPEN"), Some(root.0.join("Open")));
+
+        for msg in stored_upload[1..].iter().chain(&cut_upload[1..]) {
+            handle_local_fs_message(msg.clone(), ctx.clone()).await;
+        }
+        let mut receipts = Vec::new();
+        while receipts.len() < 2 {
+            if let P2pMessage::FileTransferReceipt {
+                transfer_id,
+                result,
+            } = next_answer(&mut out_rx).await
+            {
+                receipts.push((transfer_id, result.is_ok()));
+            }
+        }
+        receipts.sort();
+        let mut expected = vec![(stored, true), (cut, false)];
+        expected.sort();
+        assert_eq!(receipts, expected);
+        assert_eq!((held("STORED"), held("CUT")), (None, None));
+        assert_eq!(held("OPEN"), Some(root.0.join("Open")));
+
+        ctx.shutdown().await;
+        assert_eq!(held("OPEN"), None);
+    }
+
     #[cfg(unix)]
     struct Downloaded(PathBuf);
 
@@ -1920,7 +2394,7 @@ mod tests {
     async fn a_share_upload_cannot_grow_past_its_announced_size() {
         let root = Scratch::new();
         std::fs::create_dir_all(&root.0).unwrap();
-        let (ctx, _out_rx) = sharing(&root.0);
+        let (ctx, mut out_rx) = sharing(&root.0);
         let transfer_id = uuid::Uuid::new_v4();
 
         for msg in [
@@ -1950,9 +2424,244 @@ mod tests {
             handle_local_fs_message(msg, ctx.clone()).await;
         }
 
-        let uploaded = root.0.join("up.txt");
-        assert_eq!(std::fs::metadata(&uploaded).unwrap().len(), 6);
-        assert_eq!(std::fs::read(&uploaded).unwrap(), b"hi bob");
+        assert_eq!(
+            receipt(&mut out_rx).await,
+            Err("more than the 6 bytes announced".to_string())
+        );
+        assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_upload_is_confirmed_only_once_its_name_holds_every_byte() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(&root.0).unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+        let (_, mut upload) = upload_of("up.txt", 6, &[(0, b"hi "), (3, b"bob")], None);
+        let complete = upload.pop().unwrap();
+
+        for msg in upload {
+            handle_local_fs_message(msg, ctx.clone()).await;
+        }
+        assert!(matches!(
+            next_answer(&mut out_rx).await,
+            P2pMessage::FileTransferResponse {
+                status: nodeinnet_p2p::FileTransferStatus::Accepted { .. },
+                ..
+            }
+        ));
+        tokio::task::yield_now().await;
+        assert!(messages(&mut out_rx).is_empty());
+        assert!(!root.0.join("up.txt").exists());
+
+        handle_local_fs_message(complete, ctx).await;
+        assert_eq!(receipt(&mut out_rx).await, Ok(()));
+        assert_eq!(std::fs::read(root.0.join("up.txt")).unwrap(), b"hi bob");
+        assert_eq!(names_in(&root.0), ["up.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_empty_upload_is_confirmed() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(&root.0).unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+
+        for msg in upload_of("empty.txt", 0, &[], None).1 {
+            handle_local_fs_message(msg, ctx.clone()).await;
+        }
+
+        assert_eq!(receipt(&mut out_rx).await, Ok(()));
+        assert_eq!(std::fs::read(root.0.join("empty.txt")).unwrap(), b"");
+        assert_eq!(names_in(&root.0), ["empty.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_upload_cut_short_is_refused_and_leaves_no_file() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(&root.0).unwrap();
+        std::fs::write(root.0.join("up.txt"), b"old").unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+
+        for msg in upload_of("up.txt", 6, &[(0, b"hi ")], None).1 {
+            handle_local_fs_message(msg, ctx.clone()).await;
+        }
+
+        assert_eq!(
+            receipt(&mut out_rx).await,
+            Err("ended after 3 of 6 bytes".to_string())
+        );
+        assert_eq!(names_in(&root.0), ["up.txt"]);
+        assert_eq!(std::fs::read(root.0.join("up.txt")).unwrap(), b"old");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_gap_in_an_upload_is_refused_at_once() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(&root.0).unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+        let (transfer_id, mut upload) = upload_of("up.txt", 9, &[(0, b"abc"), (6, b"ghi")], None);
+        let complete = upload.pop().unwrap();
+
+        for msg in upload {
+            handle_local_fs_message(msg, ctx.clone()).await;
+        }
+        assert_eq!(
+            receipt(&mut out_rx).await,
+            Err("bytes 3..6 never arrived".to_string())
+        );
+        assert!(names_in(&root.0).is_empty());
+
+        handle_local_fs_message(complete, ctx).await;
+        assert_eq!(
+            receipt(&mut out_rx).await,
+            Err(format!("no upload {transfer_id} is open here"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_end_of_an_unknown_upload_is_refused() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(&root.0).unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+        let transfer_id = uuid::Uuid::new_v4();
+
+        handle_local_fs_message(
+            P2pMessage::FileTransferComplete {
+                transfer_id,
+                checksum: None,
+            },
+            ctx,
+        )
+        .await;
+
+        assert_eq!(
+            receipt(&mut out_rx).await,
+            Err(format!("no upload {transfer_id} is open here"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_end_of_a_refused_upload_is_refused_too() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(root.0.join("docs")).unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+
+        for name in ["../x", "docs"] {
+            let (transfer_id, upload) = upload_of(name, 1, &[(0, b"x")], None);
+            for msg in upload {
+                handle_local_fs_message(msg, ctx.clone()).await;
+            }
+            assert!(
+                matches!(
+                    next_answer(&mut out_rx).await,
+                    P2pMessage::FileTransferResponse {
+                        status: nodeinnet_p2p::FileTransferStatus::Rejected { .. },
+                        ..
+                    }
+                ),
+                "{name}"
+            );
+            assert_eq!(
+                receipt(&mut out_rx).await,
+                Err(format!("no upload {transfer_id} is open here"))
+            );
+        }
+        assert_eq!(names_in(&root.0), ["docs"]);
+        assert_eq!(std::fs::read_dir(root.0.join("docs")).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_end_of_a_session_deletes_what_an_open_upload_wrote() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(&root.0).unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+        let (transfer_id, mut upload) = upload_of("up.txt", 6, &[(0, b"hi ")], None);
+        let complete = upload.pop().unwrap();
+
+        for msg in upload {
+            handle_local_fs_message(msg, ctx.clone()).await;
+        }
+        assert_eq!(names_in(&root.0), [format!(".~{transfer_id}.part")]);
+        ctx.shutdown().await;
+        assert!(names_in(&root.0).is_empty());
+
+        handle_local_fs_message(complete, ctx).await;
+        assert_eq!(
+            receipt(&mut out_rx).await,
+            Err(format!("no upload {transfer_id} is open here"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_end_of_a_session_keeps_an_upload_already_being_stored() {
+        let root = Scratch::new();
+        std::fs::create_dir_all(&root.0).unwrap();
+        let (ctx, mut out_rx) = sharing(&root.0);
+
+        for msg in upload_of("up.txt", 6, &[(0, b"hi bob")], None).1 {
+            handle_local_fs_message(msg, ctx.clone()).await;
+        }
+        ctx.shutdown().await;
+
+        assert_eq!(receipt(&mut out_rx).await, Ok(()));
+        assert_eq!(std::fs::read(root.0.join("up.txt")).unwrap(), b"hi bob");
+        assert_eq!(names_in(&root.0), ["up.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_is_answered_with_the_systems_reason() {
+        let Some(dir) = std::env::var_os("P2P_HANDLERS_FSIZE") else {
+            let root = Scratch::new();
+            std::fs::create_dir_all(&root.0).unwrap();
+            let run = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "fs_local::tests::a_failed_write_is_answered_with_the_systems_reason",
+                ])
+                .env("P2P_HANDLERS_FSIZE", &root.0)
+                .output()
+                .unwrap();
+            assert!(
+                run.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            return;
+        };
+        let root = PathBuf::from(dir);
+        unsafe {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit), 0);
+            limit.rlim_cur = 4096;
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        }
+        let data = vec![7u8; 16 * 1024];
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (ctx, mut out_rx) = sharing(&root);
+                for msg in upload_of("big.bin", data.len() as u64, &[(0, &data)], None).1 {
+                    handle_local_fs_message(msg, ctx.clone()).await;
+                }
+                let reason = receipt(&mut out_rx).await.unwrap_err();
+                assert!(reason.contains("File too large"), "{reason}");
+                assert!(names_in(&root).is_empty());
+            });
     }
 
     #[test]

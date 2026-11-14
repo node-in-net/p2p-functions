@@ -218,11 +218,42 @@ pub async fn start_local_download(
     }
 }
 
+#[cfg(unix)]
+async fn open_regular_file(path: &Path) -> Result<tokio::fs::File, String> {
+    use std::os::fd::AsRawFd;
+    let not_regular = || "Not a regular file".to_string();
+    if !tokio::fs::metadata(path)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_file()
+    {
+        return Err(not_regular());
+    }
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !file.metadata().await.map_err(|e| e.to_string())?.is_file() {
+        return Err(not_regular());
+    }
+    let fd = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(file)
+}
+
 pub async fn open_local_file_within(
     share_base: &Path,
     target_file: &Path,
 ) -> Result<tokio::fs::File, String> {
     let safe_target = sanitize_windows_path(target_file);
+    #[cfg(unix)]
+    let file = open_regular_file(&safe_target).await?;
+    #[cfg(not(unix))]
     let file = tokio::fs::File::open(&safe_target)
         .await
         .map_err(|e| e.to_string())?;
@@ -314,28 +345,18 @@ pub async fn create_local_file(target_path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-pub async fn create_local_file_within(
+pub async fn create_new_file_within(
     share_base: &Path,
     target_path: &Path,
 ) -> Result<tokio::fs::File, String> {
     let safe_target = sanitize_windows_path(target_path);
-    let opened = match tokio::fs::OpenOptions::new()
+    let file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&safe_target)
         .await
-    {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(&safe_target)
-                .await
-        }
-        opened => opened,
-    };
-    let file = still_within(opened.map_err(|e| e.to_string())?, share_base, &safe_target).await?;
-    file.set_len(0).await.map_err(|e| e.to_string())?;
-    Ok(file)
+        .map_err(|e| e.to_string())?;
+    still_within(file, share_base, &safe_target).await
 }
 
 pub async fn write_local_file_chunk(
@@ -502,7 +523,7 @@ mod tests {
         fs::write(&outside, b"keep").unwrap();
         std::os::unix::fs::symlink(&outside, share.join("link")).unwrap();
 
-        assert!(create_local_file_within(&share, &share.join("link"))
+        assert!(create_new_file_within(&share, &share.join("link"))
             .await
             .is_err());
         assert!(open_local_file_within(&share, &share.join("link"))
@@ -511,20 +532,50 @@ mod tests {
         assert_eq!(fs::read(&outside).unwrap(), b"keep");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn a_file_created_within_the_share_starts_empty() {
+    async fn a_fifo_a_directory_or_a_device_is_refused_at_once() {
+        use std::os::unix::ffi::OsStrExt;
+        let share = tempdir().unwrap();
+        let fifo = share.path().join("pipe");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        fs::create_dir(share.path().join("dir")).unwrap();
+
+        for (base, target) in [
+            (share.path(), fifo.clone()),
+            (share.path(), share.path().join("dir")),
+            (Path::new("/dev"), PathBuf::from("/dev/null")),
+        ] {
+            let opened = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                open_local_file_within(base, &target),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                let _ = fs::OpenOptions::new().read(true).write(true).open(&fifo);
+                panic!("opening {target:?} blocked");
+            });
+            assert_eq!(
+                opened.err().as_deref(),
+                Some("Not a regular file"),
+                "{target:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_file_within_the_share_never_opens_an_old_one() {
         let share = tempdir().unwrap();
         let fresh = share.path().join("fresh.txt");
         let old = share.path().join("old.txt");
         fs::write(&old, b"old content").unwrap();
 
-        for target in [&fresh, &old] {
-            let mut file = create_local_file_within(share.path(), target)
-                .await
-                .unwrap();
-            write_file_chunk(&mut file, 0, b"new").await.unwrap();
-            assert_eq!(fs::read(target).unwrap(), b"new");
-        }
+        let mut file = create_new_file_within(share.path(), &fresh).await.unwrap();
+        write_file_chunk(&mut file, 0, b"new").await.unwrap();
+        assert_eq!(fs::read(&fresh).unwrap(), b"new");
+        assert!(create_new_file_within(share.path(), &old).await.is_err());
+        assert_eq!(fs::read(&old).unwrap(), b"old content");
     }
 
     #[test]

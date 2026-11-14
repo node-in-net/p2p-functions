@@ -9,7 +9,9 @@ use futures_util::future::{self, FutureExt};
 use std::fmt::Debug;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+const RECEIPT_WAIT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone)]
 pub struct NodeInNetDavFs {
@@ -676,17 +678,20 @@ impl DavFile for NodeInNetDavFile {
                 }
                 let _pending_guard = crate::PendingGuard(transfer_id);
 
-                let _ = p2p_tx.send(req).await;
+                p2p_tx
+                    .send(req)
+                    .await
+                    .map_err(|_| FsError::GeneralFailure)?;
 
-                match rx.recv().await {
-                    Some(nodeinnet_p2p::P2pMessage::FileTransferResponse {
+                match tokio::time::timeout(RECEIPT_WAIT, rx.recv()).await {
+                    Ok(Some(nodeinnet_p2p::P2pMessage::FileTransferResponse {
                         status: nodeinnet_p2p::FileTransferStatus::Accepted { .. },
                         ..
-                    }) => {}
-                    Some(nodeinnet_p2p::P2pMessage::FileTransferResponse {
+                    })) => {}
+                    Ok(Some(nodeinnet_p2p::P2pMessage::FileTransferResponse {
                         status: nodeinnet_p2p::FileTransferStatus::Rejected { .. },
                         ..
-                    }) => return Err(FsError::Forbidden),
+                    })) => return Err(FsError::Forbidden),
                     _ => return Err(FsError::GeneralFailure),
                 }
 
@@ -699,7 +704,7 @@ impl DavFile for NodeInNetDavFile {
                             offset: offset as u64,
                             data: chunk_data.to_vec(),
                         };
-                        let _ = p2p_tx.send(chunk).await;
+                        queue(&p2p_tx, &mut rx, chunk).await?;
                         offset += chunk_data.len();
                     }
                 }
@@ -708,14 +713,41 @@ impl DavFile for NodeInNetDavFile {
                     transfer_id,
                     checksum: None,
                 };
-                let _ = p2p_tx.send(complete).await;
+                queue(&p2p_tx, &mut rx, complete).await?;
 
-                Ok(())
+                match tokio::time::timeout(RECEIPT_WAIT, receipt(&mut rx)).await {
+                    Ok(Some(Ok(()))) => Ok(()),
+                    _ => Err(FsError::GeneralFailure),
+                }
             }
             .boxed()
         } else {
             future::ready(Ok(())).boxed()
         }
+    }
+}
+
+async fn receipt(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<nodeinnet_p2p::P2pMessage>,
+) -> Option<Result<(), String>> {
+    loop {
+        if let nodeinnet_p2p::P2pMessage::FileTransferReceipt { result, .. } = rx.recv().await? {
+            return Some(result);
+        }
+    }
+}
+
+async fn queue(
+    p2p_tx: &tokio::sync::mpsc::Sender<nodeinnet_p2p::P2pMessage>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<nodeinnet_p2p::P2pMessage>,
+    msg: nodeinnet_p2p::P2pMessage,
+) -> Result<(), FsError> {
+    tokio::select! {
+        sent = tokio::time::timeout(RECEIPT_WAIT, p2p_tx.send(msg)) => match sent {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(FsError::GeneralFailure),
+        },
+        _ = receipt(rx) => Err(FsError::GeneralFailure),
     }
 }
 
@@ -845,5 +877,130 @@ mod tests {
         let data = b"test content".to_vec();
         let f = NodeInNetDavFile::new_read(data.clone());
         assert_eq!(f.content.get_ref(), &data);
+    }
+
+    fn writer(p2p_tx: tokio::sync::mpsc::Sender<nodeinnet_p2p::P2pMessage>) -> NodeInNetDavFile {
+        NodeInNetDavFile::new_write(
+            Arc::new(Mutex::new(DavDrive::new("fs-peer".to_string()))),
+            "/docs/a.txt".to_string(),
+            b"a.txt".to_vec(),
+            p2p_tx,
+        )
+    }
+
+    async fn upload_ends(
+        p2p_rx: &mut tokio::sync::mpsc::Receiver<nodeinnet_p2p::P2pMessage>,
+    ) -> (uuid::Uuid, Vec<u8>) {
+        let transfer_id = match p2p_rx.recv().await {
+            Some(nodeinnet_p2p::P2pMessage::FileUploadRequest { transfer_id, .. }) => transfer_id,
+            other => panic!("expected the upload request, got {other:?}"),
+        };
+        assert!(
+            crate::feed_response(nodeinnet_p2p::P2pMessage::FileTransferResponse {
+                transfer_id,
+                status: nodeinnet_p2p::FileTransferStatus::Accepted { total_size: 5 },
+            })
+            .is_none()
+        );
+        let mut bytes = Vec::new();
+        loop {
+            match p2p_rx.recv().await {
+                Some(nodeinnet_p2p::P2pMessage::FileChunk { data, .. }) => bytes.extend(data),
+                Some(nodeinnet_p2p::P2pMessage::FileTransferComplete { .. }) => {
+                    return (transfer_id, bytes)
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    async fn put_answered_with(result: Result<(), String>) -> Result<(), FsError> {
+        let (p2p_tx, mut p2p_rx) = tokio::sync::mpsc::channel(8);
+        let mut file = writer(p2p_tx);
+        file.write_bytes(Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        let mut flush = file.flush();
+        let (transfer_id, bytes) = tokio::select! {
+            done = &mut flush => panic!("the PUT ended before the upload did: {done:?}"),
+            sent = upload_ends(&mut p2p_rx) => sent,
+        };
+        assert_eq!(bytes, b"hello");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut flush)
+                .await
+                .is_err(),
+            "the PUT ended before the peer answered"
+        );
+        assert!(
+            crate::feed_response(nodeinnet_p2p::P2pMessage::FileTransferReceipt {
+                transfer_id,
+                result,
+            })
+            .is_none()
+        );
+        flush.await
+    }
+
+    #[tokio::test]
+    async fn a_put_ends_only_when_the_peer_confirms_it() {
+        assert!(put_answered_with(Ok(())).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_put_the_peer_did_not_store_fails() {
+        assert!(matches!(
+            put_answered_with(Err("No space left on device".to_string())).await,
+            Err(FsError::GeneralFailure)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_put_nobody_accepts_fails_after_an_hour() {
+        let (p2p_tx, mut p2p_rx) = tokio::sync::mpsc::channel(8);
+        let mut file = writer(p2p_tx);
+        file.write_bytes(Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+
+        assert!(matches!(file.flush().await, Err(FsError::GeneralFailure)));
+        assert_eq!(started.elapsed(), RECEIPT_WAIT);
+        assert!(matches!(
+            p2p_rx.try_recv(),
+            Ok(nodeinnet_p2p::P2pMessage::FileUploadRequest { .. })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_put_whose_request_could_not_go_out_fails_at_once() {
+        let (p2p_tx, mut p2p_rx) = tokio::sync::mpsc::channel(8);
+        let mut file = writer(p2p_tx);
+        file.write_bytes(Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let mut flush = file.flush();
+        let transfer_id = tokio::select! {
+            done = &mut flush => panic!("the PUT ended before its request went out: {done:?}"),
+            sent = p2p_rx.recv() => match sent {
+                Some(nodeinnet_p2p::P2pMessage::FileUploadRequest { transfer_id, .. }) => transfer_id,
+                other => panic!("expected the upload request, got {other:?}"),
+            },
+        };
+        assert!(
+            crate::feed_response(nodeinnet_p2p::P2pMessage::FileTransferReceipt {
+                transfer_id,
+                result: Err("no connection to the device".to_string()),
+            })
+            .is_none()
+        );
+
+        assert!(matches!(flush.await, Err(FsError::GeneralFailure)));
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(
+            p2p_rx.try_recv().is_err(),
+            "the PUT streamed after it failed"
+        );
     }
 }

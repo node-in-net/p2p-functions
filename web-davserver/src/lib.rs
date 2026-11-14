@@ -181,7 +181,8 @@ pub fn feed_response(msg: nodeinnet_p2p::P2pMessage) -> Option<nodeinnet_p2p::P2
         | M::RenameEntryResponse { request_id, .. }
         | M::SetPermissionsResponse { request_id, .. } => *request_id,
         M::FileTransferResponse { transfer_id, .. }
-        | M::FileTransferComplete { transfer_id, .. } => *transfer_id,
+        | M::FileTransferComplete { transfer_id, .. }
+        | M::FileTransferReceipt { transfer_id, .. } => *transfer_id,
         _ => return Some(msg),
     };
     let tx = get_pending_requests().lock().unwrap().get(&id).cloned();
